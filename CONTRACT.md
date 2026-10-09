@@ -11,7 +11,7 @@ related: [C0, A3]
 
 # operation-proxy
 
-The contract of record for operation-proxy: what a consumer can depend on, admitted to zorg's component set by the director's ruling `D29` in zorg's `docs/DECISIONS.md`, and named by its `D30`.\
+The contract of record for operation-proxy: what a consumer can depend on, admitted to zorg's component set by the director's ruling `D29` in zorg's `docs/DECISIONS.md`, and named by its `D30`; its vision awaits the director's ratification, and until then this contract is a draft.\
 It also carries the fields of a mission-kit registry entry, and that entry is generated from this file when the component is filed, never written as a second copy.\
 The registry id is unminted on purpose; one is minted only when the entry is admitted to the registry.
 
@@ -35,11 +35,12 @@ The trait column names any trait a system takes on by using the capability.
 
 | Capability | Relation | Requires | What a consumer can depend on | Trait |
 |---|---|---|---|---|
-| `proxied-invocation` | provides | `operation-call:honest-call-ending`, `operation-call:caller-chosen-bound`, `operation-call:invocation-identity`, `operation-call:request-correlation` | A short-lived process invokes a named operation through the proxy and gets exactly one of the call layer's endings, under the bound it chose; where the hop to the proxy loses certainty, the ending is unknown, never an answer or a failure, and an invocation's identity is the same through the proxy as in a direct call. | none |
-| `caller-interface-parity` | provides | none | The client half offers the caller interface the call layer offers, so code written against the call layer runs through the proxy unchanged. | none |
-| `proxy-on-demand` | provides | none | The first process that needs a proxy for an identity starts it; processes that start at once end with one proxy, and a proxy left behind by a crash is replaced. | none |
-| `proxy-idle-expiry` | provides | none | A proxy ends after an idle time the application states, and never while an invocation it carries is in flight. | none |
-| `one-identity-per-proxy` | provides | none | Each proxy carries one identity's invocations over one connection to the delivery beneath, and never carries a process's invocation under another identity. | none |
+| `proxied-invocation` | provides | `operation-call:honest-call-ending`, `operation-call:caller-chosen-bound`, `operation-call:invocation-identity`, `operation-call:request-correlation` | A short-lived process invokes a named operation through the proxy and gets exactly one ending, within the bound it chose, kept across the hop: the call layer's ending unchanged where it has one, and unknown - never an answer, never not delivered - where the hop loses certainty; an invocation's identity is the same through the proxy as in a direct call, and an invocation whose process has gone is finished and its ending dropped. | none |
+| `caller-interface-parity` | provides | `operation-call:honest-call-ending`, `operation-call:caller-chosen-bound`, `operation-call:invocation-identity` | The client half offers the caller interface the call layer offers, so code written against the call layer runs through the proxy unchanged. | none |
+| `proxy-on-demand` | provides | none | A proxy is there when the first process of an identity needs it, with nothing set up beforehand: on a machine, processes that start at once end with one proxy, and a proxy left behind by a crash is replaced; in a browser, the browser keeps one per identity. | none |
+| `proxy-idle-expiry` | provides | none | A proxy on a machine ends after an idle time the application states, and never while an invocation it carries is in flight; in a browser, the browser ends it after the last page that uses it. | none |
+| `one-identity-per-proxy` | provides | none | Each proxy carries one identity's invocations through one caller of the call layer, invocations from processes running at once carried at the same time, and never carries a process's invocation under another identity. | none |
+| `host-local-proxy-channel` | provides | none | A proxy is reached only over a channel local to its host, never over the network, and which processes may reach it is decided by the host's own access rules on that channel. | none |
 
 The component holds nothing across a restart, coordinates no actors and contains no model, so none of its capabilities brings a trait.\
 The processes one proxy serves act under one identity, so sharing it does not make a system multi-agent.

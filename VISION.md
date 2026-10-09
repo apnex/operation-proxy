@@ -15,19 +15,27 @@ A change of direction is recorded as a decision first and absorbed here afterwar
 
 > Let short-lived processes invoke named operations through one long-lived caller they share, and learn how each invocation ended exactly as if they had called it themselves - including when the honest answer is that it cannot be known.
 
-Four terms in that sentence carry weight, so this document defines them rather than leaving them to the reader.
+Four terms in that sentence carry weight, so this document defines them rather than leaving them to the reader; a *host* is one machine, or one browser.
 
-**Short-lived process** means a program that starts, makes a few invocations, and exits, such as a command an agent runs, a hook a tool fires, or a page open in a browser tab.\
-It does not live long enough to be worth joining the delivery beneath on its own.
+**Short-lived process** means a program that may end at any moment and is one of many under its identity, such as a command an agent runs, a hook a tool fires, or a page open in a browser tab.\
+Joining the delivery beneath on its own, for every run or every page, is not worth its cost to it or to everyone else on the delivery beneath.
 
 **Long-lived caller** means one process per identity on one host - a machine, or a browser - holding the one connection to the delivery beneath and invoking on behalf of the processes it serves.\
-The first process that needs it starts it, and it ends when nothing has used it for a time the application states.
+It is there when the first process needs it and gone when none has needed it for a while, with nothing set up beforehand: on a machine, the first process starts it and it ends after an idle time the application states; in a browser, the browser starts it for the first page and ends it after the last.
 
 **Share** means every short-lived process of one identity on one host reaches the same caller.\
-Processes running at once are carried over its one connection, rather than each making its own.
+Invocations from processes running at once are carried over its one connection at the same time, rather than each process making its own connection or waiting its turn.
 
-**Exactly as if they had called it themselves** means the same four endings a direct call gives - answered, refused with a reason, not delivered, or unknown - under the bound the short-lived process chose.\
-The extra hop to the caller can add unknowns where it loses certainty; it never turns an unknown into an answer or a failure, and never gives one invocation two endings.
+**Exactly as if they had called it themselves** means the same four endings a direct call gives, within the bound the short-lived process chose:
+
+- answered;
+- refused by the operation, with its reason;
+- not delivered - the delivery beneath refused the attempt outright, so it had no effect;
+- unknown - it may have reached the operation, and no answer came within the bound.
+
+Where a direct call would have given an ending, the process gets that ending unchanged.\
+The extra hop can lose certainty a direct call would have had - the caller stopping, the local channel failing - and then the ending is unknown, never an answer and never not delivered.\
+No invocation gets two endings, and the bound holds across the hop, so a stalled hop ends at the bound like a call that was never answered.
 
 ---
 
@@ -57,16 +65,17 @@ It is embedded by an application that owns its own configuration: what the proxy
 ## What it is not
 
 **Not the call layer.**\
-It does not pair replies, time out calls, or shape refusals.\
-The call layer beneath does, and the proxy carries its endings without changing them.
+It does not pair answers with requests to operations, keep the bound on the call beneath, or shape refusals; the call layer beneath does, and its endings reach the process unchanged.\
+What the proxy adds is the hop: carrying each invocation to the caller and its ending back, keeping the process's bound across it, and saying unknown where the hop itself loses certainty.
 
 **Not a router, and not a node of its own choosing.**\
 It never decides where an operation runs or whether it is reachable.\
 It holds the one connection the call layer needs, configured by the application.
 
 **Not a store or a queue.**\
-It holds nothing that must survive its own restart.\
-An invocation in flight when the proxy stops ends, for its process, as unknown, and the proxy never takes an invocation it cannot pass on.
+It keeps only the invocations in flight, in memory, and nothing that must survive its own restart.\
+An invocation in flight when the proxy stops ends, for its process, as unknown; an invocation is taken only when it can be passed on at once, never held for later.\
+An invocation whose process has gone is still finished by the call layer, and its ending is dropped.
 
 **Not a retrier.**\
 It never repeats an invocation on its own.\
@@ -74,14 +83,14 @@ It carries each invocation's identity unchanged, so whatever owns the effect can
 
 **Not shared between identities.**\
 One proxy serves one identity.\
-It never carries a process's invocation under another identity, so who is calling stays what the delivery beneath reports.
+It never carries a process's invocation under another identity, so the operation sees every process of that identity as that one caller, and cannot tell them apart.
 
 **Not a network service.**\
 It serves processes on its own host, over a channel local to that host, and never listens on the network.\
 Which processes may use an identity's proxy is decided by the host's own access rules on that channel.
 
 **Not an authority.**\
-It passes on the call layer's evidence of who is calling and decides nothing about what a caller may do.
+It decides nothing about what a caller may do; deciding that is for the operation's host, which sees the proxy's identity.
 
 **Not agentic.**\
 It carries calls for agentic systems and contains no cognition, model, or orchestration.
@@ -102,7 +111,7 @@ Code written for the call layer runs through the proxy unchanged.\
 The measure is that the call layer's own guarantee checks, run through the proxy, give the same results as run directly.
 
 **Leanness.**\
-A short-lived process pays little for the proxy, and its user sets nothing up.\
+A short-lived process pays little for the proxy, and the person running it sets nothing up; the application that embeds the proxy supplies its configuration.\
 The measure is the cost of the first invocation, which may start the proxy, and of each later one, stated and small against a direct call.
 
 **Reuse.**\

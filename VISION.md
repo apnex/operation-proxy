@@ -20,10 +20,10 @@ Four terms in that sentence carry weight, so this document defines them rather t
 **Short-lived process** means a program that may end at any moment and is one of many under its identity, such as a command an agent runs, a hook a tool fires, or a page open in a browser tab.\
 Joining the delivery beneath on its own, for every run or every page, is not worth its cost to it or to everyone else on the delivery beneath.
 
-**Long-lived caller** means one process per identity on one host - a machine, or a browser - holding the one connection to the delivery beneath and invoking on behalf of the processes it serves.\
-It is there when the first process needs it and gone when none has needed it for a while, with nothing set up beforehand: on a machine, the first process starts it and it ends after an idle time the application states; in a browser, the browser starts it for the first page and ends it after the last.
+**Long-lived caller** means one process for each application and identity on one host - a machine, or a browser - holding the one connection to the delivery beneath and invoking on behalf of the processes it serves.\
+It is there when the first process needs it and gone when none has needed it for a while, with nothing set up beforehand: on a machine, the first process starts it, two processes starting it at once still leave one, a caller left behind by a crash is replaced, and it ends itself after an idle time the application states, never while it carries an invocation; in a browser, the browser starts it for the first page and ends it after the last.
 
-**Share** means every short-lived process of one identity on one host reaches the same caller.\
+**Share** means every short-lived process of one application and identity on one host reaches the same caller.\
 Invocations from processes running at once are carried over its one connection at the same time, rather than each process making its own connection or waiting its turn.
 
 **Exactly as if they had called it themselves** means the same four endings a direct call gives, within the bound the short-lived process chose:
@@ -35,7 +35,7 @@ Invocations from processes running at once are carried over its one connection a
 
 Where a direct call would have given an ending, the process gets that ending unchanged.\
 The extra hop can lose certainty a direct call would have had - the caller stopping, the local channel failing - and then the ending is unknown, never an answer and never not delivered.\
-No invocation gets two endings, and the bound holds across the hop, so a stalled hop ends at the bound like a call that was never answered.
+A process that is still there gets exactly one ending, and the bound holds across the hop, so a stalled hop ends at the bound like a call that was never answered.
 
 ---
 
@@ -58,7 +58,7 @@ Two halves.\
 A proxy process holds the calling side of the call layer beneath, for one identity, over one long-lived connection.\
 A client half is embedded by each short-lived process and offers the same caller interface the call layer offers, so code written against the call layer runs through the proxy unchanged.
 
-It is embedded by an application that owns its own configuration: what the proxy connects to, under which identity, and how long it waits when idle.
+It is embedded by an application that owns its own configuration: what the proxy connects to, under which identity, and, on a machine, how long it waits when idle.
 
 ---
 
@@ -74,7 +74,7 @@ It holds the one connection the call layer needs, configured by the application.
 
 **Not a store or a queue.**\
 It keeps only the invocations in flight, in memory, and nothing that must survive its own restart.\
-An invocation in flight when the proxy stops ends, for its process, as unknown; an invocation is taken only when it can be passed on at once, never held for later.\
+It hands each invocation to the call layer as it arrives and keeps no backlog of its own; an invocation in flight when the proxy stops ends, for its process, as unknown.\
 An invocation whose process has gone is still finished by the call layer, and its ending is dropped.
 
 **Not a retrier.**\
@@ -104,11 +104,11 @@ They are not weighted, and they do not collapse.
 
 **Honest endings.**\
 Every invocation through the proxy ends exactly once, within its bound, in the outcome that is true.\
-The measure is that the proxy stopping, a process vanishing, or the local channel failing produce more unknowns - never a hang, a second ending, or an unknown reported as an answer or a failure.
+The measure is that the proxy stopping or the local channel failing produce more unknowns, and a process vanishing leaves its call finished and its ending dropped - never a hang, a second ending, or an unknown reported as an answer or as not delivered.
 
 **Transparency.**\
 Code written for the call layer runs through the proxy unchanged.\
-The measure is that the call layer's own guarantee checks, run through the proxy, give the same results as run directly.
+The measure is that the call layer's own guarantee checks, run through the proxy with the hop intact, give the same results as run directly.
 
 **Leanness.**\
 A short-lived process pays little for the proxy, and the person running it sets nothing up; the application that embeds the proxy supplies its configuration.\

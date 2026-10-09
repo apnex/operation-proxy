@@ -1,5 +1,5 @@
 {
-  "name": "@apnex/operation-relay",
+  "name": "@apnex/operation-proxy",
   "version": "0.0.0",
   "private": true,
   "description": "Let short-lived processes invoke named operations through one long-lived caller they share, each invocation still ending honestly.",
@@ -7,7 +7,7 @@
   "author": "apnex",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/apnex/operation-relay.git"
+    "url": "git+https://github.com/apnex/operation-proxy.git"
   },
   "type": "module",
   "engines": {

@@ -1,4 +1,4 @@
-# operation-relay
+# operation-proxy
 
 Let short-lived processes invoke named operations through one long-lived caller they share, each invocation still ending honestly.
 

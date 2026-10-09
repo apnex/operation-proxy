@@ -17,13 +17,13 @@ A change of direction is recorded as a decision first and absorbed here afterwar
 
 Four terms in that sentence carry weight, so this document defines them rather than leaving them to the reader.
 
-**Short-lived process** means a program that starts, makes a few invocations, and exits, such as a command an agent runs or a hook a tool fires.\
+**Short-lived process** means a program that starts, makes a few invocations, and exits, such as a command an agent runs, a hook a tool fires, or a page open in a browser tab.\
 It does not live long enough to be worth joining the delivery beneath on its own.
 
-**Long-lived caller** means one process per identity on one machine, holding the one connection to the delivery beneath and invoking on behalf of the processes it serves.\
+**Long-lived caller** means one process per identity on one host - a machine, or a browser - holding the one connection to the delivery beneath and invoking on behalf of the processes it serves.\
 The first process that needs it starts it, and it ends when nothing has used it for a time the application states.
 
-**Share** means every short-lived process of one identity on one machine reaches the same caller.\
+**Share** means every short-lived process of one identity on one host reaches the same caller.\
 Processes running at once are carried over its one connection, rather than each making its own.
 
 **Exactly as if they had called it themselves** means the same four endings a direct call gives - answered, refused with a reason, not delivered, or unknown - under the bound the short-lived process chose.\
@@ -77,8 +77,8 @@ One proxy serves one identity.\
 It never carries a process's invocation under another identity, so who is calling stays what the delivery beneath reports.
 
 **Not a network service.**\
-It serves processes on its own machine, over a local channel, and never listens on the network.\
-Which processes may use an identity's proxy is decided by the machine's own access rules on that channel.
+It serves processes on its own host, over a channel local to that host, and never listens on the network.\
+Which processes may use an identity's proxy is decided by the host's own access rules on that channel.
 
 **Not an authority.**\
 It passes on the call layer's evidence of who is calling and decides nothing about what a caller may do.

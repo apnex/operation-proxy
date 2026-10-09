@@ -44,7 +44,7 @@ The trait column names any trait a system takes on by using the capability.
 The component holds nothing across a restart, coordinates no actors and contains no model, so none of its capabilities brings a trait.\
 The processes one proxy serves act under one identity, so sharing it does not make a system multi-agent.
 
-Owed before it is built: the local channel and its protocol, how a proxy is found and started, how the hop's failures map to endings, and the configuration an application supplies, designed under zorg's Delta 1.
+Owed before it is built: the local channel and its protocol, how a proxy is found and started, how the hop's failures map to endings, and the configuration an application supplies, designed under zorg's Delta 1; the channel and the hosting are adapters, an operating-system process and a local socket first, a browser's shared worker and message channel when a browser client needs them (zorg's `D31`).
 
 ---
 
@@ -60,7 +60,7 @@ This repository, `apnex/operation-proxy`, private until its first working code: 
 ### Does my project want this at all
 
 - Short-lived processes in your system invoke named operations, and each is about to join the delivery beneath on its own.
-- Many processes of one identity run on one machine, sometimes at once.
+- Many processes of one identity run on one host - a machine or a browser - sometimes at once.
 - A process must still tell "it failed" from "it may have happened", even though its call crosses an extra hop.
 
 ### Does it meet my requirement

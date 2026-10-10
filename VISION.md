@@ -20,10 +20,10 @@ Four terms in that sentence carry weight, so this document defines them rather t
 **Short-lived process** means a program that may end at any moment and is one of many under its identity, such as a command an agent runs, a hook a tool fires, or a page open in a browser tab.\
 Joining the delivery beneath on its own, for every run or every page, is not worth its cost to it or to everyone else on the delivery beneath.
 
-**Long-lived caller** means one process for each application and identity on one host - a machine, or a browser - holding the one connection to the delivery beneath and invoking on behalf of the processes it serves.\
+**Long-lived caller** means one process for each application, identity and target on one host - a machine, or a browser - holding the one connection to that target and invoking on behalf of the processes it serves; the target is what the application's calls reach, such as one service.\
 It is there when the first process needs it and gone when none has needed it for a while, with nothing set up beforehand: on a machine, the first process starts it, two processes starting it at once still leave one, a caller left behind by a crash is replaced, and it ends itself after an idle time the application states, never while it carries an invocation; in a browser, the browser starts it for the first page and ends it after the last.
 
-**Share** means every short-lived process of one application and identity on one host reaches the same caller.\
+**Share** means every short-lived process of one application and identity on one host, calling one target, reaches the same caller.\
 Invocations from processes running at once are carried over its one connection at the same time, rather than each process making its own connection or waiting its turn.
 
 **Exactly as if they had called it themselves** means the same four endings a direct call gives, within the bound the short-lived process chose:

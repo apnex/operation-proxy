@@ -51,7 +51,7 @@ The channel and the hosting are adapters, an operating-system process and a loca
 
 ## Proxy design
 
-**Maturity: provisional**, designed under zorg's Delta 1, amendment 1, and zorg's rulings `D28` to `D31`.\
+**Maturity: provisional**, designed under zorg's Delta 1, amendment 1, and zorg's rulings `D28` to `D31` and `D34`.\
 Each declaration names the exit criterion of zorg's `docs/DELTAS/DELTA-1.md` that proves it and the test that exercises it.\
 The call layer is operation-call; its endings, bound, abort signal and invocation identities are those of zorg's `docs/ARCHITECTURE-TARGET.md`, `EM11` and `EM12`.
 

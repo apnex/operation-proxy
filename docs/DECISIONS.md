@@ -34,3 +34,17 @@ Earlier entries keep the name they were written with.
 **Why.**\
 The hub sees the long-lived process as the caller, acting for the short-lived processes it serves, which is what a proxy does; the client half is a remote proxy in the classic sense.\
 "Relay" is AGP's word for passing delivery reports from hop to hop, a different idea.
+
+---
+
+## D3 - One proxy for each application, identity and target
+
+**Ruled by:** the director, 2026-10-10 (zorg's `D34`).\
+**Affects:** `VISION.md` (*Long-lived caller*, *Share*), `CONTRACT.md` (`PX1`, `one-identity-per-proxy`, `proxy-on-demand`).
+
+**Ruling.**\
+A proxy serves one application, identity and target, the target being what the application's calls reach; for zorg, a hub named by its URL and node.
+
+**Why.**\
+Two targets are two services, each needing its own connection, and refusing one while a proxy serves the other would leave the caller nothing to act on.
+

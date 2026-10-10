@@ -78,7 +78,7 @@ The client half connects to the channel socket; when there is nothing to connect
 Tested by: `E17`, in `test/contract/proxy-on-demand.test.js`: 20 processes started at once leave one owner; a proxy killed with `SIGKILL` just after taking ownership, just after listening on the channel, and while serving, is each time replaced by the next command within zorg's default connect timeout of 5 seconds; a proxy paused with `SIGSTOP` keeps ownership, so no second proxy starts and a command ends `not-delivered` with `proxy-unreachable` at its connect deadline; a starter that loses never removes the channel socket.
 
 **PX4 - The channel's messages.**\
-The channel carries newline-delimited JSON in UTF-8, one message per line, each line at most 4194304 bytes with its newline; every message is an object holding `operationProxy`, which is 1, `type`, and the fields its type names:
+The channel carries newline-delimited JSON in UTF-8, one message per line, each line at most 16785408 bytes with its newline - the largest request message the call layer sends, 16777216 bytes (`EM11`), and 8192 bytes for the channel's own fields; every message is an object holding `operationProxy`, which is 1, `type`, and the fields its type names:
 
 | Direction | `type` | Fields |
 |---|---|---|
@@ -96,11 +96,12 @@ Tested by: `E17`, in `test/contract/proxied-invocation.test.js`.
 
 **PX5 - Preparing, the bound, and when a proxied call is made.**\
 The client half offers the call layer's caller interface, and one more step, preparing: connecting, sending `hello` and receiving `welcome`, until a deadline the caller gives.\
+Before it writes an invocation, the client half applies the call layer's own checks on the caller's side (`EM11`) - numbers, depth, and a request message of at most 16777216 bytes - and ends one that fails them exactly as the call layer would, refused as `not-sendable`, so every invocation it writes fits a line.\
 An invocation's bound starts when the caller invokes, as `EM12` says; when the client half is not prepared then, preparing happens within that bound, and a connection lost between invocations is prepared again within the next invocation's bound, so a find's pages keep the one deadline `EM10` gives them.\
 On a machine, the client half sends as `deadline` the moment the bound passes on Linux's `CLOCK_MONOTONIC`, in nanoseconds, as Node's `process.hrtime.bigint()` gives it, written in decimal: one clock for every process on the machine, which a change to the wall clock does not move.\
 The proxy hands each invocation to its caller as it arrives, keeping no backlog: addressed to the endpoint `<service>/<operation>` on its host, with its operation's name, its invocation identity, its repeat flag, a bound of `deadline` less the proxy's own reading of that clock, rounded up to a whole millisecond and at most 2147483647, and an abort signal that is already fired when `aborted` is true and that the proxy fires on `abort`.\
 When less than 1 millisecond is left as the invocation arrives, the proxy does not hand it on, and answers `end` with `not-delivered`, `proxyCode` `deadline-passed`.\
-Tested by: `E17`, in `test/contract/proxied-invocation.test.js`, with the whole wire record of two calls alike but for their `service`, reaching two endpoints over one proxy, a hop delayed in each direction, preparing that takes part of the bound, a find of several pages whose connection is lost between pages, the wall clock stepped forward and back while a call is in flight, the largest bound, an abort before the send is admitted, which ends `not-delivered` with `agpCode` `ABORTED`, and one after, which changes nothing.
+Tested by: `E17`, in `test/contract/proxied-invocation.test.js`, with the whole wire record of two calls alike but for their `service`, reaching two endpoints over one proxy, an input making a request message of exactly 16777216 bytes and one of a byte more, another call in flight and a small one after each, a hop delayed in each direction, preparing that takes part of the bound, a find of several pages whose connection is lost between pages, the wall clock stepped forward and back while a call is in flight, the largest bound, an abort before the send is admitted, which ends `not-delivered` with `agpCode` `ABORTED`, and one after, which changes nothing.
 
 **PX6 - How a proxied invocation ends.**\
 The first of these events decides the ending, and nothing after it changes it:
@@ -138,7 +139,7 @@ Tested by: `E17`, in `test/contract/one-identity-per-proxy.test.js`, with a fixt
 **PX10 - The call layer's own checks, through the proxy.**\
 The call layer, operation-call, exports its caller contract cases as `@apnex/operation-call/caller-suite`: a function taking a caller and the fixture's hooks - the call bound's clock, AGP's injected clock and executor barrier, and the channel-loss hook - and registering every caller case of operation-call's contract tests.\
 The file `test/contract/caller-interface-parity.test.js` of this component runs that suite against the client half, with the proxy half in the same process over a real channel socket and AGP's production in-process carrier, the hop intact.\
-Every case passes unchanged, except that a case whose call ends at its bound accepts the `unknown` ending of `PX6` with reason `hop-stalled` and no delivery report in place of `bound-passed`, and the suite's admitted-but-never-answered case is run both ways.\
+Every case passes unchanged, except that a case whose call ends at its bound accepts the `unknown` ending of `PX6` with reason `hop-stalled` and no delivery report in place of `bound-passed`, and the suite's admitted-but-never-answered case is run both ways; the suite includes the size cases of `EM11`, a request over a peer's receive limit ending not delivered with `MESSAGE_TOO_LARGE`, with another call in flight and a small one following.\
 Tested by: `E17`, in that file; and `E6`, in operation-call's tests, which run the same suite directly.
 
 ---

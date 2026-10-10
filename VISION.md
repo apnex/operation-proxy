@@ -33,9 +33,9 @@ Invocations from processes running at once are carried over its one connection a
 - not delivered - the delivery beneath refused the attempt outright, so it had no effect;
 - unknown - it may have reached the operation, and no answer came within the bound.
 
-Where a direct call would have given an ending, the process gets that ending unchanged.\
+Where a direct call would have given an ending, the process gets that ending unchanged, when it crosses back before the bound passes.\
 The extra hop can lose certainty a direct call would have had - the caller stopping, the local channel failing - and then the ending is unknown, never an answer and never not delivered.\
-A process that is still there gets exactly one ending, and the bound holds across the hop, so a stalled hop ends at the bound like a call that was never answered.
+A process that is still there gets exactly one ending, and the bound holds across the hop, so a stalled hop ends at the bound like a call that was never answered; an ending the call layer decides at the bound itself may not cross back in time, and the process then gets unknown with the hop's reason, the ending a direct call would give with a different reason.
 
 ---
 
@@ -65,7 +65,7 @@ It is embedded by an application that owns its own configuration: what the proxy
 ## What it is not
 
 **Not the call layer.**\
-It does not pair answers with requests to operations, keep the bound on the call beneath, or shape refusals; the call layer beneath does, and its endings reach the process unchanged.\
+It does not pair answers with requests to operations, keep the bound on the call beneath, or shape refusals; the call layer beneath does, and its endings reach the process unchanged when they cross back before the bound.\
 What the proxy adds is the hop: carrying each invocation to the caller and its ending back, keeping the process's bound across it, and saying unknown where the hop itself loses certainty.
 
 **Not a router, and not a node of its own choosing.**\
@@ -108,7 +108,7 @@ The measure is that the proxy stopping or the local channel failing produce more
 
 **Transparency.**\
 Code written for the call layer runs through the proxy unchanged.\
-The measure is that the call layer's own guarantee checks, run through the proxy with the hop intact, give the same results as run directly.
+The measure is that the call layer's own guarantee checks, run through the proxy with the hop intact, give the same results as run directly, save that an ending decided at the bound may arrive as unknown with the hop's reason.
 
 **Leanness.**\
 A short-lived process pays little for the proxy, and the person running it sets nothing up; the application that embeds the proxy supplies its configuration.\

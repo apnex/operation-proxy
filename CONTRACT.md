@@ -65,10 +65,10 @@ Tested by: `E17`, in `test/contract/one-identity-per-proxy.test.js`, with a fixt
 **PX2 - Where a proxy is found on a machine.**\
 The runtime directory is `$XDG_RUNTIME_DIR/operation-proxy` when that variable is set, and otherwise `<the operating system's temporary directory>/operation-proxy-<the user's numeric id>`.\
 The client half creates it with mode `0700` when it is absent, and refuses one that is not a directory, is not owned by the user, or grants any permission to the group or to others, ending the invocation `not-delivered` with `proxyCode` `runtime-dir-unsafe`.\
-In it, the file `secret` holds 32 random lowercase hexadecimal digits, created once with mode `0600` by whichever process creates it first, exclusively, and read by every later one.\
+In it, the file `secret` holds 32 random lowercase hexadecimal digits and a newline: a process finding no `secret` writes a complete one, with mode `0600`, to `secret.<16 random hexadecimal digits>`, links that file to `secret`, which succeeds for one process only, and removes its own file, so `secret` only ever appears whole; every process then reads `secret`, and one that is not exactly 33 bytes of that form ends the invocation `not-delivered` with `proxyCode` `runtime-dir-unsafe`.\
 A key's channel is the socket `<runtime directory>/<digest>.sock`, and its ownership is the abstract-namespace socket `operation-proxy-<secret>-<digest>`, which another user cannot name without reading the secret.\
 So only the user's own processes reach a proxy, and no proxy listens on the network.\
-Tested by: `E17`, in `test/contract/host-local-proxy-channel.test.js`, which checks the modes, refuses a directory open to others, and finds no listening network port.
+Tested by: `E17`, in `test/contract/host-local-proxy-channel.test.js`, which checks the modes, refuses a directory open to others and a malformed `secret`, finds no listening network port, and starts 20 first-ever clients at once, and a client killed before and after linking, each leaving one agreed secret.
 
 **PX3 - Owning a proxy, exactly once, on a machine.**\
 A proxy owns its key while it listens on the key's abstract-namespace socket, which the operating system lets one process hold at a time and frees the moment that process ends, `SIGKILL` included.\
@@ -85,7 +85,7 @@ The channel carries newline-delimited JSON in UTF-8, one message per line, each 
 | client to proxy | `hello` | `key`, holding `application`, `identity` and `target` |
 | proxy to client | `welcome` | none |
 | proxy to client | `refused` | `code`: `key-mismatch` or `version` |
-| client to proxy | `invoke` | `request`, a whole number from 1, new for each invocation on the connection; `invocation`, an invocation identity as `EM11` writes it; `host`; `operation`; `input`; `deadline`, milliseconds since the epoch; `repeat`, true or false; `aborted`, true or false |
+| client to proxy | `invoke` | `request`, a whole number from 1, new for each invocation on the connection; `invocation`, an invocation identity as `EM11` writes it; `host`; `operation`; `input`; `deadline`, the moment the bound passes, as `PX5` writes it; `repeat`, true or false; `aborted`, true or false |
 | client to proxy | `abort` | `request` |
 | proxy to client | `end` | `request`; `ending`, the call layer's ending as `EM12` gives it, or the proxy's of `PX5` |
 
@@ -94,12 +94,13 @@ A connection carries any number of invocations at once, and their messages arriv
 A line that is longer, does not parse, or breaks this table closes the connection.\
 Tested by: `E17`, in `test/contract/proxied-invocation.test.js`.
 
-**PX5 - The bound, and when a proxied call is made.**\
-The client half measures each invocation's bound on its own monotonic clock from the moment it begins writing the `invoke` message, and sends as `deadline` the wall-clock time at which that bound passes.\
-The proxy hands each invocation to its caller as it arrives, keeping no backlog: with its invocation identity, its host, its repeat flag, a bound of `deadline` less the proxy's wall-clock time rounded up to a whole millisecond, and an abort signal that is already fired when `aborted` is true and that the proxy fires on `abort`.\
+**PX5 - Preparing, the bound, and when a proxied call is made.**\
+The client half offers the call layer's caller interface, and one more step, preparing: connecting, sending `hello` and receiving `welcome`, until a deadline the caller gives.\
+An invocation's bound starts when the caller invokes, as `EM12` says; when the client half is not prepared then, preparing happens within that bound, and a connection lost between invocations is prepared again within the next invocation's bound, so a find's pages keep the one deadline `EM10` gives them.\
+On a machine, the client half sends as `deadline` the moment the bound passes on Linux's `CLOCK_MONOTONIC`, in nanoseconds, as Node's `process.hrtime.bigint()` gives it, written in decimal: one clock for every process on the machine, which a change to the wall clock does not move.\
+The proxy hands each invocation to its caller as it arrives, keeping no backlog: with its invocation identity, its host, its repeat flag, a bound of `deadline` less the proxy's own reading of that clock, rounded up to a whole millisecond and at most 2147483647, and an abort signal that is already fired when `aborted` is true and that the proxy fires on `abort`.\
 When less than 1 millisecond is left as the invocation arrives, the proxy does not hand it on, and answers `end` with `not-delivered`, `proxyCode` `deadline-passed`.\
-So the time spent reaching a welcomed proxy is the connect deadline's, not the bound's, and the bound holds across the hop with no allowance beyond it.\
-Tested by: `E17`, in `test/contract/proxied-invocation.test.js`, with a hop delayed between the halves, a find of several pages whose pages share one deadline (`EM10`), an abort before the send is admitted, which ends `not-delivered` with `agpCode` `ABORTED`, and one after, which changes nothing.
+Tested by: `E17`, in `test/contract/proxied-invocation.test.js`, with a hop delayed in each direction, preparing that takes part of the bound, a find of several pages whose connection is lost between pages, the wall clock stepped forward and back while a call is in flight, the largest bound, an abort before the send is admitted, which ends `not-delivered` with `agpCode` `ABORTED`, and one after, which changes nothing.
 
 **PX6 - How a proxied invocation ends.**\
 The first of these events decides the ending, and nothing after it changes it:
@@ -113,7 +114,8 @@ The first of these events decides the ending, and nothing after it changes it:
 | The bound passes on the client half's clock | `unknown`, with `reason` `hop-stalled` |
 
 A channel that closes after `welcome` and before any byte of an invocation is written is no proxy at all, and the client half connects and launches again until the connect deadline.\
-A `not-delivered` ending of the call layer carries `proxyCode` `null`; one of the proxy carries `agpCode` `null`.\
+A `not-delivered` ending of the call layer carries `proxyCode` `null`; one of the proxy carries `agpCode` `null`; an `unknown` ending the client half decides carries `agpCode` `null` and `deliveryReport` `null`, since the call layer's delivery reports stay with the proxy.\
+So an invocation that ends at its bound may end `unknown` with `hop-stalled` where a direct call would end `unknown` with `bound-passed`: the ending is the same, and the hop decides its reason.\
 An abort sent across the hop changes the ending only as the call layer decides it, never by the client half alone.\
 When a short-lived process goes, the proxy finishes its calls and drops their endings, and never repeats an invocation.\
 Tested by: `E17`, in `test/contract/proxied-invocation.test.js`: each of the call layer's four endings arrives through the proxy as from a direct call; a proxy killed after the invocation was written ends it `unknown` with `proxy-lost` at once; a proxy stopped with `SIGSTOP` ends it `unknown` with `hop-stalled` at the bound; a channel closed after `welcome` and before writing leads to a new proxy; a client killed during a call leaves the fixture host one request and the proxy no second.
@@ -136,7 +138,8 @@ Tested by: `E17`, in `test/contract/one-identity-per-proxy.test.js`, with a fixt
 **PX10 - The call layer's own checks, through the proxy.**\
 The call layer, operation-call, exports its caller contract cases as `@apnex/operation-call/caller-suite`: a function taking a caller and the fixture's hooks - the call bound's clock, AGP's injected clock and executor barrier, and the channel-loss hook - and registering every caller case of operation-call's contract tests.\
 The file `test/contract/caller-interface-parity.test.js` of this component runs that suite against the client half, with the proxy half in the same process over a real channel socket and AGP's production in-process carrier, the hop intact.\
-Tested by: `E17`, in that file, with every case passing unchanged; and `E6`, in operation-call's tests, which run the same suite directly.
+Every case passes unchanged, except that a case whose call ends at its bound accepts the `unknown` ending of `PX6` with reason `hop-stalled` and no delivery report in place of `bound-passed`, and the suite's admitted-but-never-answered case is run both ways.\
+Tested by: `E17`, in that file; and `E6`, in operation-call's tests, which run the same suite directly.
 
 ---
 

@@ -35,7 +35,7 @@ Invocations from processes running at once are carried over its one connection a
 
 Where a direct call would have given an ending, the process gets that ending unchanged, when it crosses back before the bound passes.\
 The extra hop can lose certainty a direct call would have had - the caller stopping, the local channel failing - and then the ending is unknown, never an answer and never not delivered.\
-A process that is still there gets exactly one ending, and the bound holds across the hop: the call beneath is given the process's bound less a small allowance for the hop, so the process gets the ending of the direct call the proxy makes with that shorter bound, which crosses back before the process's own bound passes whenever the hop is quicker than the allowance; a hop that stalls past the allowance ends at the bound like a call that was never answered, unknown with the hop's reason.
+A process that is still there gets exactly one ending, and the bound holds across the hop: the call beneath is given the process's bound less a small allowance for the hop, so the process gets the ending of the direct call the proxy makes with that shorter bound, which is taken whenever it crosses back before the process's own bound passes - a hop quicker than the allowance is enough for that - and an ending that has not crossed back by then leaves the process unknown, with the hop's reason, like a call that was never answered.
 
 ---
 

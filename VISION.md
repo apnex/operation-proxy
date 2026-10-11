@@ -35,7 +35,7 @@ Invocations from processes running at once are carried over its one connection a
 
 Where a direct call would have given an ending, the process gets that ending unchanged, when it crosses back before the bound passes.\
 The extra hop can lose certainty a direct call would have had - the caller stopping, the local channel failing - and then the ending is unknown, never an answer and never not delivered.\
-A process that is still there gets exactly one ending, and the bound holds across the hop: the call beneath is given the process's bound less a small allowance for the hop, so the process gets the ending a direct call with that shorter bound would give, and it crosses back before the process's own bound passes; a hop that stalls past the allowance ends at the bound like a call that was never answered, unknown with the hop's reason.
+A process that is still there gets exactly one ending, and the bound holds across the hop: the call beneath is given the process's bound less a small allowance for the hop, so the process gets the ending of the direct call the proxy makes with that shorter bound, which crosses back before the process's own bound passes whenever the hop is quicker than the allowance; a hop that stalls past the allowance ends at the bound like a call that was never answered, unknown with the hop's reason.
 
 ---
 
@@ -108,7 +108,7 @@ The measure is that the proxy stopping or the local channel failing produce more
 
 **Transparency.**\
 Code written for the call layer runs through the proxy unchanged.\
-The measure is that the call layer's own guarantee checks, run through the proxy with the hop intact, give the same results as run directly, save that they are given the bound less the hop's allowance, as a direct call with that shorter bound would be; where the hop itself fails, the ending is unknown, as honest endings measure.
+The measure is that the call layer's own guarantee checks, run through the proxy with the hop intact, give the same results as run directly, save that the call beneath is the one the proxy makes, with the bound less the hop's allowance; where the hop itself fails, the ending is unknown, as honest endings measure.
 
 **Leanness.**\
 A short-lived process pays little for the proxy, and the person running it sets nothing up; the application that embeds the proxy supplies its configuration.\

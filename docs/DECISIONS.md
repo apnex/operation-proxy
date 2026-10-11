@@ -81,3 +81,17 @@ The proxy rounds its call's bound down, so the margin is never less than the all
 
 **Why.**\
 `D4` said a proxied call ends as a direct one does, up to the allowance early, which holds only for the timeout: shortening the call beneath also loses any answer, refusal, abort or delivery report that falls in the last allowance of the bound, and the earlier rounding up spent part of the margin; stated as one rule, every consequence follows from it and a test can check it by running the same invocation directly with the shorter bound.
+
+---
+
+## D6 - A proxied invocation ends as the direct call the proxy makes for it
+
+**Ruled by:** the director, 2026-10-11 (zorg's `D48`, amending `D46` and this component's `D5`).\
+**Affects:** `CONTRACT.md` - the `proxied-invocation` row, `PX5`, `PX6`, `PX8` and `PX10`; `VISION.md`.
+
+**Ruling.**\
+An invocation through the proxy ends exactly as the direct call the proxy makes for it: made when the proxy hands it on, with the abort as the proxy relays it, and with a bound ending a hop allowance before the client half's deadline - in a browser, the time remaining at posting less the allowance, counted from receipt; that ending reaches the process before its deadline whenever the return transit, and in a browser the outbound transit with it, takes less than the allowance, and otherwise the invocation ends `unknown` with `hop-stalled`.\
+The exported caller suite holds the cases of a working hop; the held and stopped hops are this component's own cases.
+
+**Why.**\
+No protocol of the proxy's can make its call match a direct call made by the process: the outbound transit starts it later, an abort crossing the hop during admission can arrive after admission, and a browser's remaining time restarts at receipt; the direct call the proxy makes is the one that exists, so the rule holds by construction and a test checks it against that call.

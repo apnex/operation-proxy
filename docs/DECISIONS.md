@@ -95,3 +95,14 @@ The exported caller suite holds the cases of a working hop; the held and stopped
 
 **Why.**\
 No protocol of the proxy's can make its call match a direct call made by the process: the outbound transit starts it later, an abort crossing the hop during admission can arrive after admission, and a browser's remaining time restarts at receipt; the direct call the proxy makes is the one that exists, so the rule holds by construction and a test checks it against that call.
+
+---
+
+## D7 - The vision is ratified
+
+**Ruled by:** the director, 2026-10-11 (zorg's `D50`).\
+**Affects:** `VISION.md`.
+
+**Ruling.**\
+The vision is ratified at `439ba68`, after three rounds of cold reading by three model families and the absorption of zorg's `D45`, `D46` and `D48`, and its status line says so.\
+From here it changes only by a recorded decision, absorbed into it.

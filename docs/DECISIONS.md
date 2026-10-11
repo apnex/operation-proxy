@@ -67,3 +67,17 @@ Accepting the exception as written; forwarding each delivery report across the h
 
 **Named costs.**\
 The operation gets the allowance less time than the caller's bound, a call that runs out its bound reports its ending up to the allowance early, and the application chooses an allowance for its hop.
+
+---
+
+## D5 - A proxied invocation ends as the same invocation made directly with the shorter bound
+
+**Ruled by:** the director, 2026-10-11 (zorg's `D46`, amending `D45` and this component's `D4`).\
+**Affects:** `CONTRACT.md` - the `proxied-invocation` row, `PX5`, `PX6`, `PX8` and `PX10`; `VISION.md`.
+
+**Ruling.**\
+An invocation with bound B through the proxy ends exactly as the same invocation made directly with a bound ending a hop allowance before B, and that ending reaches the process before B whenever the hop carries it back within the allowance; otherwise it ends `unknown` with `hop-stalled`.\
+The proxy rounds its call's bound down, so the margin is never less than the allowance; an allowance of 0, or a bound of 1 millisecond, leaves no margin; and in a browser the page sends the time remaining, not a moment on its own clock.
+
+**Why.**\
+`D4` said a proxied call ends as a direct one does, up to the allowance early, which holds only for the timeout: shortening the call beneath also loses any answer, refusal, abort or delivery report that falls in the last allowance of the bound, and the earlier rounding up spent part of the margin; stated as one rule, every consequence follows from it and a test can check it by running the same invocation directly with the shorter bound.

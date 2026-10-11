@@ -48,3 +48,22 @@ A proxy serves one application, identity and target, the target being what the a
 **Why.**\
 Two targets are two services, each needing its own connection, and refusing one while a proxy serves the other would leave the caller nothing to act on.
 
+
+---
+
+## D4 - A proxied call's bound holds back a hop allowance
+
+**Ruled by:** the director, 2026-10-11 (zorg's `D45`).\
+**Affects:** `CONTRACT.md` - the `proxied-invocation` row, `PX5`, `PX6`, `PX8`, `PX9` and `PX10`.
+
+**Ruling.**\
+The client half keeps its caller's bound and gives the proxy's call a bound that ends a hop allowance sooner - the application's allowance, by default 50 milliseconds, or half the bound if that is less - so a call that runs out its bound through a working hop ends as a direct call does, `bound-passed` with its delivery report, and `hop-stalled` means a hop that held the ending past the allowance.
+
+**Why.**\
+Giving the proxy's call the caller's whole bound made every proxied call that ran out its bound end `hop-stalled` with no delivery report, since the proxy's ending could only cross the hop after the client half's own bound had passed; the delivery report is what tells a caller of an operation that recognises no repeat whether to repeat it.
+
+**Alternatives weighed.**\
+Accepting the exception as written; forwarding each delivery report across the hop, which keeps the report but still reports `hop-stalled` on every timeout.
+
+**Named costs.**\
+The operation gets the allowance less time than the caller's bound, a call that runs out its bound reports its ending up to the allowance early, and the application chooses an allowance for its hop.

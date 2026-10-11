@@ -21,7 +21,7 @@ Four terms in that sentence carry weight, so this document defines them rather t
 Joining the delivery beneath on its own, for every run or every page, is not worth its cost to it or to everyone else on the delivery beneath.
 
 **Long-lived caller** means one process for each application, identity and target on one host - a machine, or a browser - holding the one connection to that target and invoking on behalf of the processes it serves; the target is what the application's calls reach, such as one service.\
-It is there when the first process needs it and gone when none has needed it for a while, with nothing set up beforehand: on a machine, the first process starts it, two processes starting it at once still leave one, a caller left behind by a crash is replaced, and it ends itself after an idle time the application states, never while it carries an invocation; in a browser, the browser starts it for the first page and ends it after the last.
+It is there when the first process needs it and gone when none has needed it for a while, with nothing set up beforehand: on a machine, the first process starts it, two processes starting it at once still leave one, a caller left behind by a crash is replaced, and it ends itself after an idle time the application states, never while it carries an invocation; in a browser, the browser starts it for the first page and ends it after the last, and a call still in flight then ends with it, its ending dropped as a vanished process's is.
 
 **Share** means every short-lived process of one application and identity on one host, calling one target, reaches the same caller.\
 Invocations from processes running at once are carried over its one connection at the same time, rather than each process making its own connection or waiting its turn.
@@ -30,12 +30,12 @@ Invocations from processes running at once are carried over its one connection a
 
 - answered;
 - refused by the operation, with its reason;
-- not delivered - the delivery beneath refused the attempt outright, so it had no effect;
+- not delivered - the delivery beneath refused the attempt outright, or the proxy never handed it on, so it had no effect;
 - unknown - it may have reached the operation, and no answer came within the bound.
 
 Where a direct call would have given an ending, the process gets that ending unchanged, when it crosses back before the bound passes.\
 The extra hop can lose certainty a direct call would have had - the caller stopping, the local channel failing - and then the ending is unknown, never an answer and never not delivered.\
-A process that is still there gets exactly one ending, and the bound holds across the hop, so a stalled hop ends at the bound like a call that was never answered; an ending the call layer decides at the bound itself may not cross back in time, and the process then gets unknown with the hop's reason, the ending a direct call would give with a different reason.
+A process that is still there gets exactly one ending, and the bound holds across the hop: the call beneath is given the process's bound less a small allowance for the hop, so an ending it decides at its bound crosses back in time and reaches the process as a direct call's would, up to that allowance early; a hop that stalls past the allowance ends at the bound like a call that was never answered, unknown with the hop's reason.
 
 ---
 
@@ -66,7 +66,7 @@ It is embedded by an application that owns its own configuration: what the proxy
 
 **Not the call layer.**\
 It does not pair answers with requests to operations, keep the bound on the call beneath, or shape refusals; the call layer beneath does, and its endings reach the process unchanged when they cross back before the bound.\
-What the proxy adds is the hop: carrying each invocation to the caller and its ending back, keeping the process's bound across it, and saying unknown where the hop itself loses certainty.
+What the proxy adds is the hop: carrying each invocation to the caller and its ending back, keeping the process's bound across it with a small allowance held back for the hop, and saying unknown where the hop itself loses certainty.
 
 **Not a router, and not a node of its own choosing.**\
 It never decides where an operation runs or whether it is reachable.\
@@ -83,7 +83,7 @@ It carries each invocation's identity unchanged, so whatever owns the effect can
 
 **Not shared between identities.**\
 One proxy serves one identity.\
-It never carries a process's invocation under another identity, so the operation sees every process of that identity as that one caller, and cannot tell them apart.
+It never carries a process's invocation under another identity, so the operation sees every process of that identity as that one caller, and cannot tell them apart by who is calling.
 
 **Not a network service.**\
 It serves processes on its own host, over a channel local to that host, and never listens on the network.\
@@ -103,12 +103,12 @@ Four dimensions.\
 They are not weighted, and they do not collapse.
 
 **Honest endings.**\
-Every invocation through the proxy ends exactly once, within its bound, in the outcome that is true.\
+Every invocation through the proxy ends exactly once, within its bound, in the outcome that is true, and every process still there learns that ending.\
 The measure is that the proxy stopping or the local channel failing produce more unknowns, and a process vanishing leaves its call finished and its ending dropped - never a hang, a second ending, or an unknown reported as an answer or as not delivered.
 
 **Transparency.**\
 Code written for the call layer runs through the proxy unchanged.\
-The measure is that the call layer's own guarantee checks, run through the proxy with the hop intact, give the same results as run directly, save that an ending decided at the bound may arrive as unknown with the hop's reason.
+The measure is that the call layer's own guarantee checks, run through the proxy with the hop intact, give the same results as run directly, save that an ending decided at the bound arrives up to the hop's allowance early; where the hop itself fails, the ending is unknown, as honest endings measure.
 
 **Leanness.**\
 A short-lived process pays little for the proxy, and the person running it sets nothing up; the application that embeds the proxy supplies its configuration.\

@@ -155,8 +155,10 @@ Tested by: `E17`, in that file; and `E6`, in operation-call's tests, which run t
 
 ## Reference
 
-Not yet built.\
-This repository, `apnex/operation-proxy`, private until its first working code: `VISION.md` and, once built, the implementation.
+This repository, `apnex/operation-proxy`, private until its first working code is certified.\
+The package `@apnex/operation-proxy` exports `createProxyClient` and `createProxyHalf`, the two halves over any channel and clock, `callClockOf`, `keyDigest`, `CHANNEL_LIMITS` and `DEFAULT_HOP_ALLOWANCE_MS`, and imports no module particular to one runtime; `@apnex/operation-proxy/machine` exports the machine adapter for Linux, `createMachineClient`, `startMachineProxy` and `runMachineProxy`, as `export-map.json` records.\
+The browser adapter of `PX8` is declared and not built, deferred in the export map under zorg's `D31`.\
+It depends on `@apnex/operation-call` through a `file:` link, and its tests on AGP's packages the same way.
 
 ---
 

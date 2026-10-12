@@ -1,0 +1,25 @@
+{
+  "package": "@apnex/operation-proxy",
+  "paths": {
+    ".": {
+      "exports": {
+        "createProxyClient": { "part": "operation-proxy", "serves": ["proxied-invocation", "caller-interface-parity", "proxy-on-demand"] },
+        "createProxyHalf": { "part": "operation-proxy", "serves": ["proxied-invocation", "one-identity-per-proxy", "proxy-idle-expiry"] },
+        "callClockOf": { "part": "operation-proxy", "serves": ["proxied-invocation"] },
+        "keyDigest": { "part": "operation-proxy", "serves": ["one-identity-per-proxy", "proxy-on-demand"] },
+        "CHANNEL_LIMITS": { "part": "operation-proxy", "serves": ["proxied-invocation", "host-local-proxy-channel"] },
+        "DEFAULT_HOP_ALLOWANCE_MS": { "part": "operation-proxy", "serves": ["proxied-invocation"] }
+      }
+    },
+    "./machine": {
+      "exports": {
+        "createMachineClient": { "part": "operation-proxy", "serves": ["proxied-invocation", "caller-interface-parity", "proxy-on-demand", "host-local-proxy-channel", "one-identity-per-proxy"] },
+        "startMachineProxy": { "part": "operation-proxy", "serves": ["proxied-invocation", "proxy-on-demand", "proxy-idle-expiry", "one-identity-per-proxy", "host-local-proxy-channel"] },
+        "runMachineProxy": { "part": "operation-proxy", "serves": ["proxy-on-demand", "proxy-idle-expiry", "one-identity-per-proxy", "host-local-proxy-channel"] }
+      }
+    }
+  },
+  "deferred": {
+    "browser-adapter": "D31"
+  }
+}

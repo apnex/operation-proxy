@@ -1,7 +1,9 @@
 // contract-coverage - one entry per row of CONTRACT.md, so the contract reads as a list of tests.
 //
 // A row whose test file exists beside this one is covered by that file; every other row is reported
-// as a to-do, which passes but stays visible until the capability is built and tested.
+// as a to-do, which passes but stays visible until the capability is built and tested. An adapter the
+// export map defers - the browser adapter of PX8, declared and not built - is reported as a to-do too,
+// naming the test owed with it.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -25,4 +27,10 @@ test("CONTRACT.md has a capability table with at least one row", () => {
 for (const row of rows) {
 	if (fs.existsSync(path.join(here, `${row.capability}.test.js`))) continue;
 	test.todo(`${row.capability} (${row.relation}) has no contract test yet`);
+}
+
+const map = JSON.parse(fs.readFileSync(path.join(here, "..", "..", "export-map.json"), "utf8"));
+for (const [deferred, ruling] of Object.entries(map.deferred ?? {})) {
+	if (rows.some((row) => row.capability === deferred)) continue;
+	test.todo(`${deferred} (deferred, ${ruling}) is declared and not built; its test/contract/${deferred}.test.js is owed with it`);
 }

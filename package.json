@@ -19,6 +19,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./machine": {
+      "types": "./dist/machine.d.ts",
+      "default": "./dist/machine.js"
     }
   },
   "files": [
@@ -30,7 +34,13 @@
     "docs:check": "tools/check-docs.sh"
   },
   "devDependencies": {
+    "@agp/core": "file:../agp/packages/core",
+    "@agp/node": "file:../agp/packages/node",
+    "@agp/transport-loopback": "file:../agp/packages/transport-loopback",
     "@types/node": "^24.0.0",
     "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "@apnex/operation-call": "file:../operation-call"
   }
 }

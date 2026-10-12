@@ -3,7 +3,10 @@
 //
 // Needs Unix sockets: the proxy half runs over a real channel socket on an injected clock, the machine proxy
 // in this process with an injected clock and a temporary runtime directory - at the idle boundary with a raw
-// client as a child process, and with failures injected into its stopping - and - marked "(processes)" - one
+// client as a child process, and with failures injected into its starting and stopping: a failed removal of the
+// channel socket, a failed close of the channel's server and of ownership, an observer throwing at each stage,
+// and a caller that fails to stop, each asserting the status, that every later step ran, that no server is left
+// listening, and that a later start in the same process owns the key - and - marked "(processes)" - one
 // real proxy process with an idle time of 1 second, and a real client that returns from its program.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -282,6 +285,8 @@ async function stoppingDespite(what, inject, stop) {
 		assert.deepEqual(rejections, [], `${what}: no unhandled rejection`);
 		assert.deepEqual(log.slice(4), ["stopping", "channel-closed", "caller-stop", "caller-stopped", "stopped"], `${what}: every later step still ran`);
 		assert.equal(await held(name), false, `${what}: ownership released`);
+		restore();
+		await ownedAgain(dir, key, what);
 	} finally {
 		restore();
 		await settle();
@@ -290,7 +295,17 @@ async function stoppingDespite(what, inject, stop) {
 	}
 }
 
-test("stopping despite a failure to remove the channel socket: the caller still stops, ownership is released, and stopped resolves", async () => {
+/** Checks that a later start in this process owns the key, serving until it is stopped, and stops it. */
+async function ownedAgain(dir, key, what) {
+	const stages = [];
+	const later = await startMachineProxyIn(dir, quickApplication(key, 1000, () => undefined), { clock: createManualHopClock(), observe: (stage) => stages.push(stage) });
+	assert.equal(later.owner, true, `${what}: a later start in the same process owns the key`);
+	await until(() => stages.includes("ready"), `${what}: the later start is ready`);
+	later.stop();
+	assert.equal(await later.stopped, 0, `${what}: the later start stops with status 0`);
+}
+
+test("stopping despite a failure to remove the channel socket: the caller still stops, ownership is released, stopped resolves with status 1, and a later start owns the key", async () => {
 	let socket;
 	let failures = 0;
 	await stoppingDespite("an unlink failure", (socketPath) => {
@@ -308,7 +323,7 @@ test("stopping despite a failure to remove the channel socket: the caller still 
 	assert.equal(failures, 1, "the channel socket's removal was tried once, and failed");
 });
 
-test("stopping despite a failure to close the channel's server, and to release ownership cleanly: the caller still stops, ownership is released, and stopped resolves", async () => {
+test("stopping despite a failure to close the channel's server, and to release ownership cleanly: the caller still stops, ownership is released, stopped resolves with status 1, and a later start owns the key", async () => {
 	for (const which of ["channel", "ownership"]) {
 		await stoppingDespite(`a ${which} close failure`, (socketPath) => {
 			const close = net.Server.prototype.close;
@@ -321,6 +336,94 @@ test("stopping despite a failure to close the channel's server, and to release o
 			};
 			return () => { net.Server.prototype.close = close; };
 		}, (_proxy, clock) => clock.advance(1000));
+	}
+});
+
+/**
+ * Runs a machine proxy in this process whose observer, or caller, fails at one point of its life, and gives
+ * what happened: the start's failure or the proxy, the stages observed, what its caller was asked, the servers
+ * still listening once it is done, the stopped status, and the rejections left unhandled.
+ */
+async function failingAt({ stage, callerStop }) {
+	const dir = path.join(shortTempDir(), "rt");
+	const key = { application: "fixture", identity: `failing-${process.pid}-${++faults}`, target: "quick" };
+	const stages = [];
+	const log = [];
+	const rejections = [];
+	const unhandled = (reason) => rejections.push(reason);
+	process.on("unhandledRejection", unhandled);
+	const servers = [];
+	const listen = net.Server.prototype.listen;
+	net.Server.prototype.listen = function (...args) { servers.push(this); return listen.apply(this, args); };
+	const application = quickApplication(key, 1000, (what) => log.push(what));
+	if (callerStop !== undefined) {
+		const build = application.buildCaller;
+		application.buildCaller = (...args) => ({ ...build(...args), stop: () => { log.push("caller-stop"); return callerStop(); } });
+	}
+	let proxy;
+	let startError;
+	let status;
+	try {
+		try {
+			proxy = await startMachineProxyIn(dir, application, { clock: createManualHopClock(), observe: (s) => { stages.push(s); if (s === stage) throw new Error(`observer ${s}`); } });
+		} catch (error) {
+			startError = error;
+		}
+		if (proxy !== undefined) {
+			proxy.stopped.then((s) => { status = s; });
+			await until(() => stages.includes("ready") || status !== undefined, "ready, or stopped");
+			proxy.stop();
+			await until(() => status !== undefined, "stopped to resolve");
+		}
+		await settle();
+		const name = ownershipName(ensureRuntime(dir), keyDigest(key));
+		const result = { startError, status, stages, log, listening: servers.filter((server) => server.listening).length, owned: await held(name), socket: fs.existsSync(path.join(dir, `${keyDigest(key)}.sock`)), rejections: [...rejections] };
+		net.Server.prototype.listen = listen;
+		await ownedAgain(dir, key, stage ?? "a caller that fails to stop");
+		return result;
+	} finally {
+		net.Server.prototype.listen = listen;
+		for (const server of servers) if (server.listening) await new Promise((resolve) => server.close(resolve));
+		process.removeListener("unhandledRejection", unhandled);
+		fs.rmSync(path.dirname(dir), { recursive: true, force: true });
+	}
+}
+
+test("a start that fails after taking ownership - an observer throwing at owned or at listening - closes the channel's server and then ownership before its failure is given, and a later start in the same process owns the key", async () => {
+	for (const [stage, seen] of [["owned", ["owned"]], ["listening", ["owned", "listening"]]]) {
+		const r = await failingAt({ stage });
+		assert.equal(r.startError?.message, `observer ${stage}`, `${stage}: the start fails with the observer's failure`);
+		assert.deepEqual(r.stages, seen, `${stage}: nothing started after it`);
+		assert.equal(r.listening, 0, `${stage}: no server left listening, the channel's nor ownership's`);
+		assert.equal(r.owned, false, `${stage}: ownership released before the failure is given`);
+		assert.equal(r.socket, false, `${stage}: no channel socket left`);
+		assert.deepEqual(r.rejections, [], `${stage}: no unhandled rejection`);
+	}
+});
+
+test("an observer throwing at each later stage of starting and of stopping makes the status 1; every later step still runs, no server is left listening, and a later start owns the key", async () => {
+	for (const stage of ["built", "ready", "stopping", "channel-closed", "caller-stopped", "stopped"]) {
+		const r = await failingAt({ stage });
+		assert.equal(r.startError, undefined, `${stage}: the start itself succeeds`);
+		assert.equal(r.status, 1, `${stage}: the status says a step failed`);
+		assert.deepEqual(r.stages.slice(r.stages.indexOf("stopping")), ["stopping", "channel-closed", "caller-stopped", "stopped"], `${stage}: every later step still ran`);
+		assert.deepEqual(r.log, ["caller-stop"], `${stage}: the caller was stopped`);
+		assert.equal(r.listening, 0, `${stage}: no server left listening`);
+		assert.equal(r.owned, false, `${stage}: ownership released`);
+		assert.equal(r.socket, false, `${stage}: the channel socket removed`);
+		assert.deepEqual(r.rejections, [], `${stage}: no unhandled rejection`);
+	}
+});
+
+test("a caller that fails to stop, throwing or rejecting, leaves the status as it was, 0; every later step still runs, and a later start owns the key", async () => {
+	for (const [what, callerStop] of [["throwing", () => { throw new Error("stop failed"); }], ["rejecting", () => Promise.reject(new Error("stop failed"))]]) {
+		const r = await failingAt({ callerStop });
+		assert.equal(r.status, 0, `${what}: the status as it was`);
+		assert.deepEqual(r.stages.slice(r.stages.indexOf("stopping")), ["stopping", "channel-closed", "caller-stopped", "stopped"], `${what}: every later step still ran`);
+		assert.deepEqual(r.log, ["caller-stop"], `${what}: the caller was asked to stop`);
+		assert.equal(r.listening, 0, `${what}: no server left listening`);
+		assert.equal(r.owned, false, `${what}: ownership released`);
+		assert.deepEqual(r.rejections, [], `${what}: no unhandled rejection`);
 	}
 });
 

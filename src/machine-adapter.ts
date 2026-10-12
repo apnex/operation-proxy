@@ -11,7 +11,9 @@
  * Stopping (PX7): when the idle timer finds the proxy idle, and on `SIGTERM` or `SIGINT` once each call in
  * flight has ended and its ending has been sent, the proxy stops accepting connections, closes those not
  * welcomed and then the rest, closes and removes the channel socket, stops its caller, and stops listening on
- * the ownership socket last, so the next owner can take the key only after the last step.
+ * the ownership socket last, so the next owner can take the key only after the last step. A start that fails
+ * after taking ownership - an observer throwing at `owned` or `listening` included - closes what it opened, the
+ * channel's server and then ownership, before its failure is given, so a later start in this process owns the key.
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -200,18 +202,21 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	const ownership = await own(ownershipName(secret, digest));
 	if (ownership === undefined) return Object.freeze({ owner: false, stopped: Promise.resolve(0), stop: () => undefined });
 	const held: net.Server = ownership;
-	observe("owned");
-	let server: net.Server;
+	let server: net.Server | undefined;
 	try {
+		observe("owned");
 		removeLeftover(socketPath);
 		server = await listenChannel(socketPath, accept);
+		half = createProxyHalf({ key, clock, idleMs, onIdle: () => void stopNow(0) });
+		observe("listening");
 	} catch (error) {
-		await closeServer(ownership).catch(() => undefined);
+		// A start that fails after taking ownership closes what it opened - the channel's server, and then
+		// ownership - before its failure is given, so a later start, in this process or another, owns the key (PX7).
+		await unstart(server, half);
 		throw error;
 	}
-	half = createProxyHalf({ key, clock, idleMs, onIdle: () => void stopNow(0) });
-	const proxyHalf = half;
-	observe("listening");
+	const channel: net.Server = server;
+	const proxyHalf: ProxyHalf = half;
 
 	const callClock = callClockOf(clock);
 	let built: ProxiedCaller | undefined;
@@ -226,6 +231,30 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		proxyHalf.ready(caller.caller, callClock);
 		observe("ready");
 	}).catch(() => void stopNow(1));
+
+	/**
+	 * Undoes a start that failed after taking ownership: no connection is accepted any more, the proxy half's
+	 * idle timer is stopped and its connections closed, the channel's server is closed and its socket removed,
+	 * and ownership is released last; each step runs on its own, so one that fails keeps no later one from running.
+	 */
+	async function unstart(opened: net.Server | undefined, made: ProxyHalf | undefined): Promise<void> {
+		stopping = true;
+		const step = async (action: () => unknown): Promise<void> => {
+			try {
+				await action();
+			} catch {
+				// The start's own failure is what is given; this step's leaves the later steps to run.
+			}
+		};
+		await step(() => made?.stopIdle());
+		await step(() => made?.closeAll());
+		for (const socket of sockets) await step(() => socket.destroy());
+		if (opened !== undefined) {
+			await step(() => closeServer(opened));
+			await step(() => fs.rmSync(socketPath, { force: true }));
+		}
+		await step(() => closeServer(held));
+	}
 
 	/**
 	 * The one shutdown: started once, by the idle timer, by a request once drained, or by a caller that could not be
@@ -261,7 +290,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		await step(() => proxyHalf.stopIdle());
 		let closing: Promise<void> = Promise.resolve();
 		await step(() => {
-			closing = closeServer(server);
+			closing = closeServer(channel);
 			// Observed here at once; its failure is recorded when it is awaited below.
 			closing.catch(() => undefined);
 		});

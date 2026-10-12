@@ -4,7 +4,9 @@
  *
  * An invocation's bound starts when the caller invokes (EM12). The client half applies the call layer's own
  * checks on the caller's side first, so a programming error is thrown and a request the call layer would
- * refuse as `not-sendable` is refused so, with nothing written. It keeps its own deadline - the moment the
+ * refuse as `not-sendable` is refused so, with nothing written; it then reads its clock again, and a deadline
+ * passed by then - at it exactly included - ends the invocation `unknown` with `bound-passed` and the attempt
+ * identity it made, nothing written, as the call layer's caller does. It keeps its own deadline - the moment the
  * bound passes - and sends the proxy a sooner one, a hop allowance earlier: the application's allowance, by
  * default 50 milliseconds, or half the bound if that is less, rounded down to a whole millisecond (PX5).
  * When it is not prepared, preparing happens within the bound.
@@ -15,6 +17,12 @@
  * and the deadline passing before its `end` is read (`unknown`, `hop-stalled`). The deadline is a moment on
  * the clock: an event read at or after it is discarded, whichever runs first, the timer or the read. An
  * abort is relayed across the hop and changes the ending only as the call layer decides it, never here.
+ * Endings of the client half's own checks come before these events, which follow those checks (PX6).
+ *
+ * A clock port that throws is a fault of the port (EM12): a reading that fails as an event is observed shows
+ * nothing passed, so that event decides; a timer whose wakeup cannot read the clock takes its own word that
+ * the deadline came; and settling resolves the chosen ending and releases its accounting before any step of
+ * cleanup, each of which runs on its own, so a timer that cannot be cancelled changes nothing.
  * Nothing here is particular to one runtime (zorg's principle 6).
  */
 import type { CallRequest, IdentitySource, JsonValue, OperationCaller, RefusalRecord } from "@apnex/operation-call";
@@ -23,7 +31,7 @@ import { checkCall, utf8Bytes } from "./call-checks.js";
 import { CHANNEL_LIMITS, writeInvoke } from "./channel-messages.js";
 import { Preparer, type ClientConnector, type Connection, type Prepared, type Waiter, type WrittenInvocation } from "./client-preparing.js";
 import { freezeEnding, hopUnknown, preparingNotDelivered, proxyNotDelivered, type CarriedEnding, type PreparingEnding, type ProxiedEnding } from "./endings.js";
-import { atMoment, msToNs, type HopClock } from "./hop-clock.js";
+import { atMoment, msToNs, type HopClock, type HopTimer } from "./hop-clock.js";
 import { checkKey, type ProxyKey } from "./key.js";
 
 /** The hop allowance an application has unless it states its own (PX5, PX9). */
@@ -129,32 +137,53 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 		const repeat = call.repeat === true;
 		const deadline = start + msToNs(call.bound);
 		const sooner = deadline - msToNs(allowanceFor(allowanceMs, call.bound));
-		// The call layer's own checks on the caller's side (EM11), on the request it will send for this call.
+		// The call layer's own checks on the caller's side (EM11), on the request it will send for this call, and
+		// the line the invocation is written on (PX4).
 		const attempt = `${invocation}.${randomHex(8)}`;
-		if (!requestSendable(writeRequest({ invocation, attempt, operation }, input))) {
-			return Promise.resolve(Object.freeze({ ending: "refused", invocation, attempt, operation, refusal: notSendable() }));
-		}
 		const fields = { invocation, host: call.host, service: call.service, operation, input, deadline: sooner.toString(), repeat };
-		if (!fitsLine(fields)) return Promise.resolve(Object.freeze({ ending: "refused", invocation, attempt, operation, refusal: notSendable() }));
+		const sendable = requestSendable(writeRequest({ invocation, attempt, operation }, input)) && fitsLine(fields);
+		// Checked: the clock is read again, so a deadline that passed while checking - at it exactly included - wins
+		// over a refusal the checks found, as in the call layer's caller, and nothing is written (PX5).
+		if (clock.nowNs() >= deadline) {
+			return Promise.resolve(Object.freeze({ ending: "unknown", invocation, attempt, operation, reason: "bound-passed", agpCode: null, deliveryReport: null }));
+		}
+		if (!sendable) return Promise.resolve(Object.freeze({ ending: "refused", invocation, attempt, operation, refusal: notSendable() }));
 		const signal = call.signal;
 
 		return new Promise<ProxiedEnding>((resolve) => {
 			let decided = false;
 			let connection: Connection | undefined;
 			let request: number | undefined;
+			let timer: HopTimer | undefined;
+			/**
+			 * Settles the chosen ending: its accounting is released and the ending resolved first, and then each step
+			 * of cleanup runs on its own, so a step that throws - a clock port that cannot cancel its timer among them
+			 * - changes neither the ending nor any step after it (EM12).
+			 */
 			const decide = (ending: ProxiedEnding): void => {
 				if (decided) return;
 				decided = true;
-				timer.cancel();
-				signal?.removeEventListener("abort", relay);
-				preparer.withdraw(waiter);
-				if (connection !== undefined && request !== undefined) connection.decided(request);
+				if (connection !== undefined && request !== undefined) guarded(() => connection?.decided(request as number));
 				resolve(freezeEnding(ending));
+				guarded(() => timer?.cancel());
+				guarded(() => signal?.removeEventListener("abort", relay));
+				guarded(() => preparer.withdraw(waiter));
+			};
+			/**
+			 * True once the deadline has passed on the clock as it is read now; a reading the port cannot give is a
+			 * fault of the port, which shows nothing passed, so the event observed decides (EM12).
+			 */
+			const passed = (): boolean => {
+				try {
+					return clock.nowNs() >= deadline;
+				} catch {
+					return false;
+				}
 			};
 			/** An event read now: at or after the deadline, the deadline came first and the hop stalled. */
 			const read = (ending: () => ProxiedEnding): void => {
 				if (decided) return;
-				decide(clock.nowNs() < deadline ? ending() : hopUnknown("hop-stalled", invocation, operation));
+				decide(passed() ? hopUnknown("hop-stalled", invocation, operation) : ending());
 			};
 			const written: WrittenInvocation = {
 				invocation,
@@ -164,7 +193,7 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 			};
 			const write = (c: Connection): void => {
 				if (decided) return;
-				if (clock.nowNs() >= deadline) return decide(hopUnknown("hop-stalled", invocation, operation));
+				if (passed()) return decide(hopUnknown("hop-stalled", invocation, operation));
 				const number = c.write(written, { ...fields, aborted: signal?.aborted === true });
 				// Nothing of it was written: a connection closed before writing is no proxy at all (PX6).
 				if (number === undefined) return acquire();
@@ -192,7 +221,7 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 			const relay = (): void => {
 				if (!decided && connection !== undefined && request !== undefined) connection.abort(request);
 			};
-			const timer = atMoment(clock, deadline, () => {
+			timer = atMoment(clock, deadline, () => {
 				if (decided) return;
 				decide(request === undefined
 					? proxyNotDelivered("proxy-unreachable", invocation, operation, repeat)
@@ -217,12 +246,17 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 		if (signal?.aborted === true) return Promise.reject(signal.reason);
 		return new Promise((resolve, reject) => {
 			let decided = false;
+			let timer: HopTimer | undefined;
+			/**
+			 * Decides preparing, once: true for the one caller that settles it, whose settling no step of cleanup
+			 * can keep back, since each step runs on its own and a step that throws changes nothing (EM12).
+			 */
 			const done = (): boolean => {
 				if (decided) return false;
 				decided = true;
-				timer.cancel();
-				signal?.removeEventListener("abort", aborted);
-				preparer.withdraw(waiter);
+				guarded(() => timer?.cancel());
+				guarded(() => signal?.removeEventListener("abort", aborted));
+				guarded(() => preparer.withdraw(waiter));
 				return true;
 			};
 			const waiter: Waiter = {
@@ -237,7 +271,7 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 			const aborted = (): void => {
 				if (done()) reject(signal?.reason);
 			};
-			const timer = atMoment(clock, deadline, () => {
+			timer = atMoment(clock, deadline, () => {
 				if (done()) resolve(unreachable("proxy-unreachable"));
 			});
 			signal?.addEventListener("abort", aborted, { once: true });
@@ -246,6 +280,15 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 	};
 
 	return Object.freeze({ invoke, prepare, newInvocation, close: () => preparer.close() });
+}
+
+/** Runs one step of cleanup on its own: a step that throws changes nothing already decided, nor any step after it. */
+function guarded(step: () => void): void {
+	try {
+		step();
+	} catch {
+		// The ending is settled; what the step left behind finds its invocation decided.
+	}
 }
 
 /** True when an invocation's `invoke` line fits the channel's line limit, its newline included (PX4). */

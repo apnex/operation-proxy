@@ -752,6 +752,57 @@ test("PX5: the wall clock stepped forward and back while a call is in flight mov
 	});
 });
 
+/** An input whose reading, as the client half checks it, moves the hop clock `ms` and gives `value`: a slow getter. */
+const slowInput = (c, ms, value) => ({ get n() { c.clock.move(ms); return value; } });
+
+/** Asserts an ending of the client half's own checks with the deadline passed: as the call layer's caller ends it. */
+function passedWhileChecking(ending, operation, what, invocation) {
+	assert.deepEqual(Object.keys(ending).sort(), ["agpCode", "attempt", "deliveryReport", "ending", "invocation", "operation", "reason"], `${what}: exactly an unknown ending's fields`);
+	assert.deepEqual([ending.ending, ending.reason, ending.agpCode, ending.deliveryReport, ending.operation], ["unknown", "bound-passed", null, null, operation], `${what}: unknown, bound-passed, no AGP code or delivery report`);
+	if (invocation !== undefined) assert.equal(ending.invocation, invocation, `${what}: the invocation given`);
+	assert.match(ending.invocation, /^\d{13}-[0-9a-f]{16}$/, `${what}: an invocation identity`);
+	assert.match(ending.attempt, /^\d{13}-[0-9a-f]{16}\.[0-9a-f]{8}$/, `${what}: the attempt identity it made, as EM11 writes it`);
+	assert.ok(ending.attempt.startsWith(`${ending.invocation}.`), `${what}: an attempt of its invocation`);
+	assert.ok(Object.isFrozen(ending), `${what}: frozen`);
+}
+
+test("PX5, PX6: a deadline passing while the client half checks an invocation, prepared and unprepared, with a sendable and an unsendable input, and at the deadline exactly, ends unknown with bound-passed, its attempt identity and nothing written; a check finishing before the deadline refuses not-sendable exactly", { timeout: 60_000 }, async () => {
+	await withCase({}, async (c) => {
+		const bound = 100;
+		const variants = [
+			["a sendable input, the deadline passed", 107.5, 1],
+			["a sendable input, at the deadline exactly", 100, 1],
+			["an unsendable input, the deadline passed", 107.5, 2 ** 60],
+			// The second verification's reproduction: a getter spending the whole bound and giving an unsafe integer.
+			["an unsendable input, at the deadline exactly", 100, 2 ** 60],
+		];
+		const check = async (state) => {
+			for (const [what, ms, value] of variants) {
+				const wire = c.wire.length;
+				const invocation = c.client.newInvocation();
+				const ending = await c.call({ operation: "echo", input: slowInput(c, ms, value), bound, invocation });
+				passedWhileChecking(ending, "echo", `${state}, ${what}`, invocation);
+				passedWhileChecking(await c.call({ operation: "echo", input: slowInput(c, ms, value), bound }), "echo", `${state}, ${what}, no invocation given`);
+				assert.equal(c.wire.length, wire, `${state}, ${what}: nothing written`);
+			}
+			// The check finishing a nanosecond before the deadline: the refusal the check found stands, exactly.
+			const wire = c.wire.length;
+			const refused = await c.call({ operation: "echo", input: slowInput(c, 99.999999, 2 ** 60), bound });
+			assert.deepEqual(Object.keys(refused).sort(), ["attempt", "ending", "invocation", "operation", "refusal"], `${state}: exactly a refused ending's fields`);
+			assert.deepEqual([refused.ending, refused.refusal], ["refused", NOT_SENDABLE], `${state}: refused not-sendable, exactly as the call layer refuses`);
+			assert.ok(refused.attempt.startsWith(`${refused.invocation}.`) && Object.isFrozen(refused), `${state}: under its attempt identity, frozen`);
+			assert.equal(c.wire.length, wire, `${state}: nothing written`);
+		};
+		await check("unprepared");
+		assert.deepEqual(c.wire, [], "unprepared: nothing written at all, not even hello, and no proxy made a call");
+		assert.equal(c.hop.launches(), 0, "unprepared: nothing launched");
+		assert.equal((await c.ended({ operation: "echo", input: "prepared" })).answer, "prepared", "an invocation prepares the client half");
+		await check("prepared");
+		assert.equal(c.invokes().length, 1, "prepared: only the one call was ever written");
+		assert.equal(c.calls.length, 1, "the proxy made only that call");
+	});
+});
+
 // ---------------------------------------------------------------------------------------------------------
 // PX6 - how a proxied invocation ends; PX10's held and stopped hops.
 

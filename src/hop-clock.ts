@@ -42,17 +42,24 @@ export function msToNs(ms: number): bigint {
 
 /**
  * Calls `callback` once the clock reads `deadlineNs` or later, never sooner: each wakeup reads the clock and,
- * while the deadline has not come, arms the timer again for the time remaining (EM12's lesson).
+ * while the deadline has not come, arms the timer again for the time remaining (EM12's lesson). A clock that
+ * can no longer be read or schedule at a wakeup is a fault of the port and leaves nothing to wait on, so the
+ * timer's word is taken that the moment has come, as the call layer's caller takes it (EM12); nothing thrown
+ * by the port escapes into the runtime's timer.
  */
 export function atMoment(clock: HopClock, deadlineNs: bigint, callback: () => void): HopTimer {
 	let done = false;
 	let timer: HopTimer | undefined;
 	const wake = (): void => {
 		if (done) return;
-		const left = deadlineNs - clock.nowNs();
-		if (left > 0n) {
-			timer = clock.schedule(msCeil(left), wake);
-			return;
+		try {
+			const left = deadlineNs - clock.nowNs();
+			if (left > 0n) {
+				timer = clock.schedule(msCeil(left), wake);
+				return;
+			}
+		} catch {
+			// The port failed: the timer's word is taken.
 		}
 		done = true;
 		callback();

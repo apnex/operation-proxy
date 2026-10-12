@@ -1,10 +1,12 @@
 // caller-interface-parity - the client half offers the caller interface the call layer offers, so code written
 // against the call layer runs through the proxy unchanged (CONTRACT.md, PX10; zorg's E17).
 //
-// operation-call's exported caller suite (@apnex/operation-call/caller-suite, at 2e435a8 or later) runs against
-// the client half, with the proxy half in the same process over a real channel socket and AGP's production
-// in-process carrier, the hop intact, its allowance stated: every case, none excluded, each judged by PX5's
-// rule. Needs Unix sockets; spawns no child process.
+// operation-call's exported caller suite (@apnex/operation-call/caller-suite, at 26c9353 or later, and for the
+// clock port's faults the revision that adds them) runs against the client half, with the proxy half in the
+// same process over a real channel socket and AGP's production in-process carrier, the hop intact, its
+// allowance stated: every case, none excluded, each judged by PX5's rule. The harness's fault hook makes the
+// client half's own clock port throw, never the proxy half's or the call layer's beneath it, and reports each
+// throw (PX10; zorg's EM12). Needs Unix sockets; spawns no child process.
 //
 // The same parity holds for the types (zorg's target, EM12): test/types/caller-interface-parity.ts, a strict
 // TypeScript function accepting operation-call's OperationCaller given operation-call's caller and the client
@@ -35,6 +37,14 @@ test("every case of every row of the caller suite is registered through the clie
 	assert.equal(registered, all.length);
 	assert.ok(registered >= 58, `the suite holds ${registered} cases`);
 	for (const row of callerSuiteRows.rows) assert.ok(names.some((n) => n.startsWith(`${row}: `)), `row ${row} runs`);
+	// The suite's revision holds the clock port's faults: an answer, a refusal, a refusal before anything reaches a
+	// host - here, of preparing - and the bound, each as a reading and as a timer's cancellation throws (PX10).
+	const faults = names.filter((n) => n.startsWith("honest-call-ending: a clock port that throws at "));
+	for (const at of ["a reading", "a timer's cancellation"]) {
+		for (const event of ["an answer", "an operation's refusal", "a refusal before anything reaches a host", "the bound"]) {
+			assert.equal(faults.filter((n) => n.includes(`throws at ${at} as ${event} decides`)).length, 1, `the clock port throwing at ${at} as ${event} decides`);
+		}
+	}
 });
 
 test("a strict TypeScript consumer accepting OperationCaller, given operation-call's caller and the client half unchanged, is compiled by npm test (EM12)", () => {

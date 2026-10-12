@@ -10,6 +10,12 @@
  * a waiter whose deadline has passed learns only that it came late, since an event happens when it occurs
  * on the clock, not when its callback runs (EM12). A waiter whose deadline passes is withdrawn by its own
  * timer, and when none is left the loop stops and closes a connection still waiting for `welcome`.
+ *
+ * The preparer owns every failure of its loop, so none goes unobserved and none keeps an outcome from its
+ * waiters: a clock reading that fails as an outcome is observed is a fault of the port, which shows no deadline
+ * passed, so the outcome is delivered as observed (EM12); one waiter that throws as it settles keeps no other
+ * from settling; a connection attempt that fails is no proxy at all; and a wait between attempts that cannot
+ * be armed ends the loop, leaving each waiter to its own deadline, as one that the loop's backstop catches does.
  * Nothing here is particular to one runtime.
  */
 import type { ChannelLink, LinkHandlers } from "./channel-link.js";
@@ -149,8 +155,20 @@ export interface Waiter {
 	settle(prepared: Prepared): void;
 }
 
-/** What one attempt to connect found; an outcome a waiter learns carries the moment it was read. */
-type Attempt = (Prepared & { readonly at?: bigint }) | { readonly kind: "absent" } | { readonly kind: "dropped" } | { readonly kind: "abandoned" };
+/**
+ * What one attempt to connect found; an outcome a waiter learns carries the moment it was read, or undefined
+ * when the clock port could not give that reading.
+ */
+type Attempt = (Prepared & { readonly at?: bigint | undefined }) | { readonly kind: "absent" } | { readonly kind: "dropped" } | { readonly kind: "abandoned" };
+
+/** Runs one step on its own: a step that throws changes nothing already decided, nor any step after it. */
+function guarded(step: () => void): void {
+	try {
+		step();
+	} catch {
+		// What the step left behind finds its waiter settled.
+	}
+}
 
 /** The client half's preparing: one welcomed connection at a time, and the loop that obtains it. */
 export class Preparer {
@@ -172,7 +190,9 @@ export class Preparer {
 	/** Adds a waiter, starting the loop if it is not running. */
 	wait(waiter: Waiter): void {
 		this.#waiters.add(waiter);
-		if (!this.#running) void this.#loop();
+		// The loop observes its own failures; this backstop observes one it could not foresee, which ends the loop
+		// and leaves each waiter to its own deadline.
+		if (!this.#running) this.#loop().catch(() => undefined);
 	}
 
 	/** Withdraws a waiter; with none left, a connection still waiting for `welcome` is closed and the loop stops. */
@@ -188,32 +208,47 @@ export class Preparer {
 		for (const link of [...this.#links]) link.close();
 	}
 
+	/** The clock as it reads now, or undefined when the port cannot give a reading, a fault of the port (EM12). */
+	#read(): bigint | undefined {
+		try {
+			return this.clock.nowNs();
+		} catch {
+			return undefined;
+		}
+	}
+
 	/**
 	 * Delivers an outcome to every waiter: those whose deadline had passed on the clock when the outcome was read
-	 * learn it came late.
+	 * learn it came late; with no reading, nothing shows a deadline passed, and the outcome observed decides. Each
+	 * waiter settles on its own, so one that throws keeps no other from its outcome.
 	 */
-	#deliver(prepared: Prepared, at: bigint = this.clock.nowNs()): void {
-		const now = at;
+	#deliver(prepared: Prepared, at: bigint | undefined): void {
 		const waiters = [...this.#waiters];
 		this.#waiters.clear();
-		for (const waiter of waiters) waiter.settle(now < waiter.deadline ? prepared : { kind: "late" });
+		for (const waiter of waiters) guarded(() => waiter.settle(at !== undefined && at >= waiter.deadline ? { kind: "late" } : prepared));
 	}
 
 	async #loop(): Promise<void> {
 		this.#running = true;
 		try {
 			while (this.#waiters.size > 0) {
-				const attempt = await this.#attempt();
+				let attempt: Attempt;
+				try {
+					attempt = await this.#attempt();
+				} catch {
+					// An attempt that failed found no proxy.
+					attempt = { kind: "dropped" };
+				}
 				if (attempt.kind === "ready") {
 					this.#current = attempt.connection;
 					this.#deliver({ kind: "ready", connection: attempt.connection }, attempt.at);
 				} else if (attempt.kind === "refused") {
 					this.#deliver({ kind: "refused", code: attempt.code }, attempt.at);
 				} else if (attempt.kind === "unsafe") {
-					this.#deliver({ kind: "unsafe" });
+					this.#deliver({ kind: "unsafe" }, this.#read());
 				} else if (attempt.kind === "absent" || attempt.kind === "dropped") {
-					const now = this.clock.nowNs();
-					if (this.#lastLaunch === undefined || now - this.#lastLaunch >= msToNs(RELAUNCH_MS)) {
+					const now = this.#read();
+					if (now === undefined || this.#lastLaunch === undefined || now - this.#lastLaunch >= msToNs(RELAUNCH_MS)) {
 						this.#lastLaunch = now;
 						try {
 							this.connector.launch();
@@ -221,7 +256,7 @@ export class Preparer {
 							// A command that cannot be launched leaves the waiters to their connect deadline.
 						}
 					}
-					if (this.#waiters.size > 0) await this.#sleep(now + msToNs(RECONNECT_MS));
+					if (this.#waiters.size > 0 && !await this.#sleep(now)) break;
 				}
 			}
 		} finally {
@@ -229,17 +264,24 @@ export class Preparer {
 		}
 	}
 
-	/** Waits until the clock reads `until`, or until no waiter is left. */
-	#sleep(until: bigint): Promise<void> {
+	/**
+	 * Waits until the clock reads `RECONNECT_MS` after `from`, or that long by the port's timer alone when there
+	 * was no reading, or until no waiter is left: true then, and false when no timer could be armed.
+	 */
+	#sleep(from: bigint | undefined): Promise<boolean> {
 		return new Promise((resolve) => {
 			let timer: HopTimer | undefined;
-			const done = (): void => {
+			const done = (slept: boolean): void => {
 				this.#wake = undefined;
-				timer?.cancel();
-				resolve();
+				guarded(() => timer?.cancel());
+				resolve(slept);
 			};
-			this.#wake = done;
-			timer = atMoment(this.clock, until, done);
+			this.#wake = () => done(true);
+			try {
+				timer = from === undefined ? this.clock.schedule(RECONNECT_MS, () => done(true)) : atMoment(this.clock, from + msToNs(RECONNECT_MS), () => done(true));
+			} catch {
+				done(false);
+			}
 		});
 	}
 
@@ -271,7 +313,7 @@ export class Preparer {
 			};
 			const drop = (attempt: Attempt): void => {
 				route.message = () => undefined;
-				link.close();
+				guarded(() => link.close());
 				finish(attempt);
 			};
 			route.message = (value) => {
@@ -285,9 +327,9 @@ export class Preparer {
 					route.closed = connection.closed;
 					// Welcomed and idle until an invocation is written on it, which holds it again.
 					link.hold(false);
-					finish({ kind: "ready", connection, at: this.clock.nowNs() });
+					finish({ kind: "ready", connection, at: this.#read() });
 				} else if (message?.type === "refused") {
-					drop({ kind: "refused", code: message.code, at: this.clock.nowNs() });
+					drop({ kind: "refused", code: message.code, at: this.#read() });
 				} else {
 					// Anything else before `welcome` breaks the table: no proxy at all (PX6).
 					drop({ kind: "dropped" });
@@ -298,8 +340,13 @@ export class Preparer {
 				finish({ kind: "dropped" });
 			};
 			this.#abandon = () => drop({ kind: "abandoned" });
-			link.hold(true);
-			if (!link.write(writeHello(this.key))) finish({ kind: "dropped" });
+			try {
+				link.hold(true);
+				if (!link.write(writeHello(this.key))) finish({ kind: "dropped" });
+			} catch {
+				// A connection that cannot be held or written to is no proxy at all.
+				drop({ kind: "dropped" });
+			}
 		});
 	}
 }

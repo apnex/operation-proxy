@@ -25,8 +25,9 @@ export function shortTempDir(prefix = "opx-") {
 }
 
 /**
- * Opens a hop. Options: clock, the hop clock every part reads; allowanceMs, the client half's hop allowance
- * (default 50); holdDeliveryReports; idleMs and onIdle for the proxy half; readiness, a promise the proxy
+ * Opens a hop. Options: clock, the hop clock every part reads; clientClock, the client half's own clock port
+ * over it, where a case puts something between them, such as the caller suite's fault hook; allowanceMs, the
+ * client half's hop allowance (default 50); holdDeliveryReports; idleMs and onIdle for the proxy half; readiness, a promise the proxy
  * awaits before its caller is ready; inbound and outbound taps; connect, a wrapper of the client's connector;
  * wrapCaller, a wrapper of the proxy's recording caller, for a case whose proxy's caller misbehaves.
  */
@@ -69,7 +70,7 @@ export async function openHop(options) {
 	let launches = 0;
 	const baseConnector = { connect: (handlers) => connectChannel(socketPath, handlers), launch: () => { launches++; } };
 	const connector = options.connect ? options.connect(baseConnector) : baseConnector;
-	const client = createProxyClient({ key: KEY, hopAllowanceMs: options.allowanceMs ?? 50, connector, clock, identities: machineIdentities });
+	const client = createProxyClient({ key: KEY, hopAllowanceMs: options.allowanceMs ?? 50, connector, clock: options.clientClock ?? clock, identities: machineIdentities });
 	const becomeReady = async () => {
 		await options.readiness;
 		half.ready(options.wrapCaller ? options.wrapCaller(recording) : recording, callClock);

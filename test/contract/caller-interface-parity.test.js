@@ -2,7 +2,7 @@
 // against the call layer runs through the proxy unchanged (CONTRACT.md, PX10; zorg's E17).
 //
 // operation-call's exported caller suite (@apnex/operation-call/caller-suite, at 26c9353 or later, and for the
-// clock port's faults the revision that adds them) runs against the client half, with the proxy half in the
+// clock port's faults, and for a malformed abort signal, the revisions that add them) runs against the client half, with the proxy half in the
 // same process over a real channel socket and AGP's production in-process carrier, the hop intact, its
 // allowance stated: every case, none excluded, each judged by PX5's rule. The harness's fault hook makes the
 // client half's own clock port throw, never the proxy half's or the call layer's beneath it, and reports each
@@ -45,6 +45,9 @@ test("every case of every row of the caller suite is registered through the clie
 			assert.equal(faults.filter((n) => n.includes(`throws at ${at} as ${event} decides`)).length, 1, `the clock port throwing at ${at} as ${event} decides`);
 		}
 	}
+	// And it holds a malformed abort signal among its invalid arguments, which the client half throws as the call
+	// layer's caller does (zorg's EM12).
+	assert.equal(names.filter((n) => n.startsWith("honest-call-ending: an abort signal that is given and is not an abort signal")).length, 1, "the malformed abort signal");
 });
 
 test("a strict TypeScript consumer accepting OperationCaller, given operation-call's caller and the client half unchanged, is compiled by npm test (EM12)", () => {

@@ -128,7 +128,18 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 		return `${String(ms).padStart(13, "0")}-${randomHex(16)}`;
 	};
 
+	/**
+	 * A caller's programming error is thrown as operation-call's caller throws it (EM12): the promise invoke gives
+	 * rejects with it, nothing written, and invoke itself never throws as it is called.
+	 */
 	const invoke = (call: CallRequest): Promise<ProxiedEnding> => {
+		try {
+			return invokeChecked(call);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	};
+	const invokeChecked = (call: CallRequest): Promise<ProxiedEnding> => {
 		// The bound starts when the caller invokes (EM12): the clock is read before anything else is done.
 		const start = clock.nowNs();
 		const input = checkCall(call);

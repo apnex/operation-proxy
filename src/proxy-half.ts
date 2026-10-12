@@ -18,7 +18,7 @@
  * of its clock later, so a connection waiting to be accepted is counted - and stays if a connection is open or
  * a call is in flight (PX7). Nothing here is particular to one runtime.
  */
-import type { OperationCaller } from "@apnex/operation-call";
+import type { CallLayerEnding, CallRequest } from "@apnex/operation-call";
 import { MAX_BOUND_MS } from "./call-checks.js";
 import type { ChannelLink, LinkHandlers } from "./channel-link.js";
 import { isOtherVersion, readHello, readInvokeOrAbort, writeEnd, writeRefused, writeWelcome, type InvokeMessage } from "./channel-messages.js";
@@ -35,6 +35,14 @@ export function checkIdleTime(value: unknown): number {
 		throw new RangeError("an idle time is a whole number of milliseconds from 1000 (1 second) to 86400000 (24 hours)");
 	}
 	return value as number;
+}
+
+/**
+ * The proxy's caller: the call layer's own, giving only the call layer's endings (EM12), which an `end` carries
+ * (PX4). operation-call's caller is one.
+ */
+export interface CallLayerCaller {
+	invoke(call: CallRequest): Promise<CallLayerEnding>;
 }
 
 /** What a proxy half is built from. */
@@ -57,7 +65,7 @@ export interface ProxyHalf {
 	 * The application's caller is ready by its own test (PX9): every connection waiting is welcomed, and each
 	 * call is made through this caller, whose clock port is `callClock`.
 	 */
-	ready(caller: OperationCaller, callClock: PinnableCallClock): void;
+	ready(caller: CallLayerCaller, callClock: PinnableCallClock): void;
 	/** How many connections are open. */
 	connections(): number;
 	/** How many calls are in flight: handed to the caller, their endings not yet sent or dropped. */
@@ -88,7 +96,7 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 	const idleMs = checkIdleTime(options.idleMs);
 	const { clock, onIdle } = options;
 	const conns = new Set<Conn>();
-	let caller: OperationCaller | undefined;
+	let caller: CallLayerCaller | undefined;
 	let callClock: PinnableCallClock | undefined;
 	let inFlight = 0;
 	let idleTimer: HopTimer | undefined;
@@ -137,7 +145,7 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 		const now = clock.nowNs();
 		const left = BigInt(invoke.deadline) - now;
 		if (left < NS_PER_MS || caller === undefined || callClock === undefined) {
-			send(conn, invoke.request, proxyNotDelivered("deadline-passed", invoke.invocation, invoke.operation, invoke.repeat) as CarriedEnding);
+			send(conn, invoke.request, proxyNotDelivered("deadline-passed", invoke.invocation, invoke.operation, invoke.repeat));
 			return;
 		}
 		const bound = Number(left / NS_PER_MS > BigInt(MAX_BOUND_MS) ? BigInt(MAX_BOUND_MS) : left / NS_PER_MS);
@@ -146,7 +154,7 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 		conn.calls.set(invoke.request, controller);
 		inFlight++;
 		reviewIdle();
-		let ending: Promise<unknown>;
+		let ending: Promise<CallLayerEnding>;
 		// The call's bound starts at the reading it was computed from, so its deadline is never later than `deadline`.
 		callClock.pin(now);
 		try {
@@ -159,7 +167,7 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 		} finally {
 			callClock.unpin();
 		}
-		Promise.resolve(ending).then((value) => send(conn, invoke.request, value as CarriedEnding), () => {
+		Promise.resolve(ending).then((value) => send(conn, invoke.request, value), () => {
 			// A caller that rejects gives no ending to carry; the client half's deadline decides, as hop-stalled.
 		}).finally(() => {
 			conn.calls.delete(invoke.request);
@@ -228,7 +236,7 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 				},
 			};
 		},
-		ready(readyCaller: OperationCaller, readyClock: PinnableCallClock): void {
+		ready(readyCaller: CallLayerCaller, readyClock: PinnableCallClock): void {
 			if (caller !== undefined) return;
 			caller = readyCaller;
 			callClock = readyClock;

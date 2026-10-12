@@ -27,7 +27,8 @@ export function shortTempDir(prefix = "opx-") {
 /**
  * Opens a hop. Options: clock, the hop clock every part reads; allowanceMs, the client half's hop allowance
  * (default 50); holdDeliveryReports; idleMs and onIdle for the proxy half; readiness, a promise the proxy
- * awaits before its caller is ready; inbound and outbound taps; connect, a wrapper of the client's connector.
+ * awaits before its caller is ready; inbound and outbound taps; connect, a wrapper of the client's connector;
+ * wrapCaller, a wrapper of the proxy's recording caller, for a case whose proxy's caller misbehaves.
  */
 export async function openHop(options) {
 	const clock = options.clock;
@@ -71,7 +72,7 @@ export async function openHop(options) {
 	const client = createProxyClient({ key: KEY, hopAllowanceMs: options.allowanceMs ?? 50, connector, clock, identities: machineIdentities });
 	const becomeReady = async () => {
 		await options.readiness;
-		half.ready(recording, callClock);
+		half.ready(options.wrapCaller ? options.wrapCaller(recording) : recording, callClock);
 	};
 	const ready = becomeReady();
 	return {

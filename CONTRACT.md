@@ -134,6 +134,7 @@ Tested by: `E17`, in `test/contract/proxied-invocation.test.js`: each of the cal
 **PX7 - Idle ending and stopping on a machine.**\
 A proxy is idle while no connection is open and no call is in flight; when its idle timer of the application's idle time, from 1 second to 24 hours, fires, it checks again once the connections the operating system has already accepted are taken, and stays if a connection is open or a call is in flight.\
 Otherwise, and on `SIGTERM` or `SIGINT` once each call in flight has ended within its bound and its ending has been sent, it stops accepting connections, closes those not welcomed and then, their calls having ended, those welcomed, closes and removes the channel socket, stops its caller, and stops listening on the ownership socket last, then exits with status 0.\
+A step that fails - closing the channel's server, removing its socket, releasing ownership, or an observer that throws - is recorded and every later step still runs, so ownership is always released, and the proxy then exits with status 1; a caller that fails to stop leaves the status as it was.\
 A client whose connection closes before `welcome` treats it as no proxy (`PX6`), and the next owner can only take the key after the last step.\
 Tested by: `E17`, in `test/contract/proxy-idle-expiry.test.js`, with an injected clock for the proxy half and one real process with an idle time of 1 second, including a client connecting as the idle timer fires and a call in flight past the idle time, which keeps the proxy running.
 

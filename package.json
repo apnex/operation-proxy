@@ -30,7 +30,8 @@
   ],
   "scripts": {
     "build": "tsc -p .",
-    "test": "npm run build && node --test \"test/**/*.test.js\"",
+    "test": "npm run build && npm run test:types && node --test \"test/**/*.test.js\"",
+    "test:types": "tsc -p test/types",
     "docs:check": "tools/check-docs.sh"
   },
   "devDependencies": {

@@ -15,7 +15,7 @@ import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { keyDigest } from "@apnex/operation-proxy";
 import { createMachineClientIn } from "../../dist/machine-adapter.js";
-import { ensureRuntime, RuntimeUnsafe, runtimeDirectory } from "../../dist/machine-runtime-adapter.js";
+import { ensureDirectory, ensureRuntime, RuntimeUnsafe, runtimeDirectory } from "../../dist/machine-runtime-adapter.js";
 import { shortTempDir } from "../support/hop.js";
 import { alive, fixture, sleep, waitFor } from "../support/processes.js";
 
@@ -100,8 +100,46 @@ test("a runtime directory open to its group or to others, not a directory, or no
 	const link = path.join(temp(), "rt");
 	fs.symlinkSync(target, link);
 	assertUnsafe(await invokeIn(link), "a symbolic link to a directory");
-	assert.throws(() => ensureRuntime("/proc/1/fd"), (e) => e instanceof RuntimeUnsafe && e.reason === "not-owned", "a directory of another user, with no permission for group or others");
-	assertUnsafe(await invokeIn("/proc/1/fd"), "a directory of another user");
+	const foreign = foreignDirectory();
+	assert.notEqual(fs.lstatSync(foreign).uid, process.getuid(), `${foreign} belongs to another user`);
+	assert.throws(() => ensureRuntime(foreign), (e) => e instanceof RuntimeUnsafe && e.reason === "not-owned", `${foreign}, a directory of another user, refused as not owned before anything is written`);
+	assertUnsafe(await invokeIn(foreign), `${foreign}, a directory of another user`);
+});
+
+/**
+ * A directory owned by another user, found at run time and verified so: one of the system's own, read and never
+ * written, preferring one granting nothing to its group or to others, so ownership alone refuses it; or, for a
+ * test run as root, where every system directory is its own, a fresh temporary directory given to another user.
+ */
+function foreignDirectory() {
+	const uid = process.getuid();
+	const candidates = ["/root", "/proc/1/fd", "/", "/proc/1", "/usr", "/etc", "/var", "/tmp"];
+	const foreign = candidates.filter((dir) => {
+		try {
+			const stat = fs.lstatSync(dir);
+			return stat.isDirectory() && stat.uid !== uid;
+		} catch {
+			return false;
+		}
+	});
+	const closed = foreign.find((dir) => (fs.lstatSync(dir).mode & 0o077) === 0);
+	if (closed ?? foreign[0]) return closed ?? foreign[0];
+	assert.equal(uid, 0, "no directory of another user was found, and only root can make one");
+	const made = path.join(temp(), "foreign");
+	fs.mkdirSync(made, { mode: 0o700 });
+	fs.chownSync(made, 65534, 65534);
+	return made;
+}
+
+test("the ownership comparison, through an injected status: a directory of another user, mode 0700, is refused not-owned; the user's own is taken", () => {
+	const uid = process.getuid();
+	const system = (owner, mode = 0o40700) => ({ lstat: () => ({ isDirectory: () => true, uid: owner, mode }), uid: () => uid });
+	for (const other of [uid + 1, uid === 0 ? 1 : 0, 65534].filter((o) => o !== uid)) {
+		assert.throws(() => ensureDirectory("/nowhere/rt", system(other)), (e) => e instanceof RuntimeUnsafe && e.reason === "not-owned", `uid ${other}`);
+	}
+	assert.doesNotThrow(() => ensureDirectory("/nowhere/rt", system(uid)), "the user's own directory, mode 0700");
+	assert.throws(() => ensureDirectory("/nowhere/rt", system(uid, 0o40750)), (e) => e.reason === "open-to-others", "the user's own, open to its group");
+	assert.throws(() => ensureDirectory("/nowhere/rt", { ...system(uid), uid: () => undefined }), (e) => e.reason === "not-owned", "a user that cannot be named owns nothing");
 });
 
 test("a secret that is not exactly 33 bytes of 32 lowercase hexadecimal digits and a newline is refused: not-delivered with runtime-dir-unsafe", async () => {
@@ -117,6 +155,23 @@ test("a secret that is not exactly 33 bytes of 32 lowercase hexadecimal digits a
 	fs.mkdirSync(path.join(dir, "secret"), { recursive: true });
 	fs.chmodSync(dir, 0o700);
 	assertUnsafe(await invokeIn(dir), "a directory named secret");
+});
+
+test("a secret that is a symbolic link, even to a well-formed secret of the user's, is refused: not-delivered with runtime-dir-unsafe, and the link left as it is", async () => {
+	const elsewhere = path.join(temp(), "secret");
+	fs.writeFileSync(elsewhere, "0123456789abcdef0123456789abcdef\n", { mode: 0o600 });
+	for (const [what, target] of [["a link to a well-formed secret", elsewhere], ["a dangling link", path.join(temp(), "absent")], ["a link to a directory", temp()]]) {
+		const dir = path.join(temp(), "rt");
+		fs.mkdirSync(dir, { mode: 0o700 });
+		fs.chmodSync(dir, 0o700);
+		fs.symlinkSync(target, path.join(dir, "secret"));
+		assert.throws(() => ensureRuntime(dir), (e) => e instanceof RuntimeUnsafe && e.reason === "secret-malformed", what);
+		assertUnsafe(await invokeIn(dir), what);
+		assert.ok(fs.lstatSync(path.join(dir, "secret")).isSymbolicLink(), `${what}: left as it was`);
+		assert.equal(fs.readlinkSync(path.join(dir, "secret")), target, `${what}: still pointing where it did`);
+		assert.deepEqual(fs.readdirSync(dir), ["secret"], `${what}: nothing written beside it`);
+	}
+	assert.equal(fs.readFileSync(elsewhere, "latin1"), "0123456789abcdef0123456789abcdef\n", "the linked file untouched");
 });
 
 test("a channel socket path longer than 107 bytes is refused: not-delivered with runtime-dir-unsafe; one of 107 bytes is used", async () => {

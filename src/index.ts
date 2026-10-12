@@ -10,10 +10,10 @@
  * CHANNEL_LIMITS, DEFAULT_HOP_ALLOWANCE_MS - proxied-invocation, host-local-proxy-channel: PX4's line limit, PX5's allowance.
  */
 export { createProxyClient, DEFAULT_HOP_ALLOWANCE_MS, type PrepareOptions, type ProxyClient, type ProxyClientOptions } from "./client-half.js";
-export { createProxyHalf, type ProxyHalf, type ProxyHalfOptions } from "./proxy-half.js";
+export { createProxyHalf, type CallLayerCaller, type ProxyHalf, type ProxyHalfOptions } from "./proxy-half.js";
 export { callClockOf, type HopClock, type HopTimer, type PinnableCallClock } from "./hop-clock.js";
 export { keyDigest, type ProxyKey } from "./key.js";
 export { CHANNEL_LIMITS, type ChannelMessage, type RefusalCode } from "./channel-messages.js";
 export type { ChannelLink, LinkHandlers } from "./channel-link.js";
 export type { ClientConnector, ConnectOutcome } from "./client-preparing.js";
-export type { CarriedEnding, HopReason, HopUnknownEnding, ProxiedEnding, ProxyCode, ProxyNotDeliveredEnding } from "./endings.js";
+export type { CarriedEnding, DeadlinePassedEnding, HopReason, HopUnknownEnding, PreparingEnding, ProxiedEnding, ProxyCode, ProxyNotDeliveredEnding } from "./endings.js";

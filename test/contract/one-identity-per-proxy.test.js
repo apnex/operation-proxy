@@ -26,7 +26,12 @@ test("PX1: two keys differing only in target get two proxies, each owning its ow
 	const one = make();
 	const two = make({ key: { ...one.config.key, target: "fixture host-a, another hub" }, runtimeDir: one.config.runtimeDir });
 	assert.notEqual(one.digest, two.digest);
-	const [a, b] = await Promise.all([one.client({ operation: "which" }).ack(60_000), two.client({ operation: "which" }).ack(60_000)]);
+	// Two proxies start at once, each building its caller: under load that can take longer than zorg's default
+	// connect timeout, so preparing has a load-tolerant budget here; replacing a crashed proxy within 5 seconds
+	// is proxy-on-demand's requirement, held there.
+	const call = { operation: "which", connectMs: 30_000, bound: 30_000 };
+	const [a, b] = await Promise.all([one.client(call).ack(90_000), two.client(call).ack(90_000)]);
+	for (const [ack, f] of [[a, one], [b, two]]) assert.equal(ack.ending.ending, "answered", `${f.digest}: ${JSON.stringify(ack.ending)}`);
 	assert.notEqual(a.ending.answer.pid, b.ending.answer.pid, "two proxies");
 	assert.ok(fs.existsSync(one.socketPath()) && fs.existsSync(two.socketPath()) && one.socketPath() !== two.socketPath());
 	const unix = fs.readFileSync("/proc/net/unix", "utf8");

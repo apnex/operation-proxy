@@ -16,7 +16,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
-import type { CallClock, IdentitySource, OperationCaller } from "@apnex/operation-call";
+import type { CallClock, IdentitySource } from "@apnex/operation-call";
 import type { LinkHandlers } from "./channel-link.js";
 import { createProxyClient, checkHopAllowance, DEFAULT_HOP_ALLOWANCE_MS, type ProxyClient } from "./client-half.js";
 import { callClockOf, type HopClock } from "./hop-clock.js";
@@ -24,7 +24,7 @@ import { checkKey, keyDigest, type ProxyKey } from "./key.js";
 import { connectChannel, listenChannel, socketLink } from "./machine-channel-adapter.js";
 import { machineClock, machineIdentities } from "./machine-clock-adapter.js";
 import { channelPath, ensureRuntime, ownershipName, runtimeDirectory, RuntimeUnsafe } from "./machine-runtime-adapter.js";
-import { checkIdleTime, createProxyHalf, type ProxyHalf } from "./proxy-half.js";
+import { checkIdleTime, createProxyHalf, type CallLayerCaller, type ProxyHalf } from "./proxy-half.js";
 
 /** The command that launches an application's proxy (PX3, PX9). */
 export interface LaunchCommand {
@@ -46,7 +46,7 @@ export interface MachineClientApplication {
 /** The proxy's caller, as the application builds it from the key (PX1, PX9). */
 export interface ProxiedCaller {
 	/** One caller of the call layer, with its one connection to the target. */
-	readonly caller: OperationCaller;
+	readonly caller: CallLayerCaller;
 	/** Stops the caller - its node and its connection - when the proxy stops (PX7). */
 	stop(): Promise<void> | void;
 }
@@ -80,7 +80,10 @@ export interface MachineProxyOptions {
 export interface MachineProxy {
 	/** False when another proxy owned the key, and this one stopped, touching nothing. */
 	readonly owner: boolean;
-	/** Resolves with the exit status once the proxy has stopped: 0, or 1 when its caller could not be built. */
+	/**
+	 * Resolves with the exit status once the proxy has stopped, and never rejects: 0, or 1 when its caller could not
+	 * be built or made ready, or a step of stopping failed (PX7).
+	 */
 	readonly stopped: Promise<number>;
 	/** Stops as on `SIGTERM`: once each call in flight has ended and its ending has been sent. */
 	stop(): void;
@@ -146,9 +149,9 @@ function own(name: string): Promise<net.Server | undefined> {
 	});
 }
 
-/** Closes a server, resolving once it is closed. */
+/** Closes a server: resolves once it is closed, and rejects when closing it fails. */
 function closeServer(server: net.Server): Promise<void> {
-	return new Promise((resolve) => server.close(() => resolve()));
+	return new Promise((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)));
 }
 
 /** Removes a socket left at the channel's path by an earlier owner; anything else there is refused. */
@@ -203,7 +206,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		removeLeftover(socketPath);
 		server = await listenChannel(socketPath, accept);
 	} catch (error) {
-		await closeServer(ownership);
+		await closeServer(ownership).catch(() => undefined);
 		throw error;
 	}
 	half = createProxyHalf({ key, clock, idleMs, onIdle: () => void stopNow(0) });
@@ -224,36 +227,65 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		observe("ready");
 	}).catch(() => void stopNow(1));
 
-	/** The stopping steps of PX7, in order, ownership released last. */
-	async function stopNow(status: number): Promise<void> {
-		if (stopping) return;
-		stopping = true;
-		observe("stopping");
-		proxyHalf.stopIdle();
-		const closing = new Promise<void>((resolve) => server.close(() => resolve()));
-		proxyHalf.closeUnwelcomed();
-		proxyHalf.closeAll();
-		const flushed = Promise.all([...sockets].map((s) => new Promise<void>((resolve) => s.once("close", () => resolve()))));
-		const late = setTimeout(() => { for (const s of sockets) s.destroy(); }, 2000);
-		await flushed;
-		clearTimeout(late);
-		await closing;
-		fs.rmSync(socketPath, { force: true });
-		observe("channel-closed");
-		try {
-			await building;
-		} catch {
-			// No caller was built, so there is none to stop.
+	/**
+	 * The one shutdown: started once, by the idle timer, by a request once drained, or by a caller that could not be
+	 * built or made ready, and never rejecting, so no path that starts it leaves a rejection unobserved. It ends
+	 * with `stopped` resolved, whatever step failed.
+	 */
+	let shutdown: Promise<void> | undefined;
+	function stopNow(status: number): Promise<void> {
+		if (shutdown === undefined) {
+			stopping = true;
+			shutdown = stopSteps(status).then(resolveStopped, () => resolveStopped(1));
 		}
-		try {
-			await built?.stop();
-		} catch {
-			// A caller that fails to stop still stops the proxy.
-		}
-		observe("caller-stopped");
-		await closeServer(held);
-		observe("stopped");
-		resolveStopped(status);
+		return shutdown;
+	}
+
+	/**
+	 * The stopping steps of PX7, in order, ownership released last. A step that fails - closing the channel's
+	 * server, removing its socket, releasing ownership - is recorded, and the steps after it still run, so the
+	 * caller is still stopped and ownership still released; the status is then 1. A caller that fails to stop
+	 * still stops the proxy, as before.
+	 */
+	async function stopSteps(status: number): Promise<number> {
+		let failed = false;
+		/** One step: its failure, thrown or rejected, is recorded, and stopping goes on. */
+		const step = async (action: () => unknown, fails = true): Promise<void> => {
+			try {
+				await action();
+			} catch {
+				if (fails) failed = true;
+			}
+		};
+		await step(() => observe("stopping"));
+		await step(() => proxyHalf.stopIdle());
+		let closing: Promise<void> = Promise.resolve();
+		await step(() => {
+			closing = closeServer(server);
+			// Observed here at once; its failure is recorded when it is awaited below.
+			closing.catch(() => undefined);
+		});
+		await step(() => proxyHalf.closeUnwelcomed());
+		await step(() => proxyHalf.closeAll());
+		await step(async () => {
+			const flushed = Promise.all([...sockets].map((s) => new Promise<void>((resolve) => s.once("close", () => resolve()))));
+			const late = setTimeout(() => { for (const s of sockets) s.destroy(); }, 2000);
+			try {
+				await flushed;
+			} finally {
+				clearTimeout(late);
+			}
+		});
+		await step(() => closing);
+		await step(() => fs.rmSync(socketPath, { force: true }));
+		await step(() => observe("channel-closed"));
+		// No caller was built when building failed, so there is none to stop.
+		await step(() => building, false);
+		await step(() => built?.stop(), false);
+		await step(() => observe("caller-stopped"));
+		await step(() => closeServer(held));
+		await step(() => observe("stopped"));
+		return failed ? 1 : status;
 	}
 
 	return Object.freeze({
@@ -262,7 +294,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		stop(): void {
 			if (stopping || draining) return;
 			draining = true;
-			void proxyHalf.drained().then(() => stopNow(0));
+			proxyHalf.drained().then(() => stopNow(0)).catch(() => undefined);
 		},
 	});
 }

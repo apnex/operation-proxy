@@ -17,12 +17,12 @@
  * abort is relayed across the hop and changes the ending only as the call layer decides it, never here.
  * Nothing here is particular to one runtime (zorg's principle 6).
  */
-import type { CallRequest, IdentitySource, JsonValue, RefusalRecord } from "@apnex/operation-call";
+import type { CallRequest, IdentitySource, JsonValue, OperationCaller, RefusalRecord } from "@apnex/operation-call";
 import { requestSendable, writeRequest } from "@apnex/operation-call/message-format";
 import { checkCall, utf8Bytes } from "./call-checks.js";
 import { CHANNEL_LIMITS, writeInvoke } from "./channel-messages.js";
 import { Preparer, type ClientConnector, type Connection, type Prepared, type Waiter, type WrittenInvocation } from "./client-preparing.js";
-import { freezeEnding, hopUnknown, proxyNotDelivered, type CarriedEnding, type ProxiedEnding, type ProxyNotDeliveredEnding } from "./endings.js";
+import { freezeEnding, hopUnknown, preparingNotDelivered, proxyNotDelivered, type CarriedEnding, type PreparingEnding, type ProxiedEnding } from "./endings.js";
 import { atMoment, msToNs, type HopClock } from "./hop-clock.js";
 import { checkKey, type ProxyKey } from "./key.js";
 
@@ -57,8 +57,11 @@ export interface PrepareOptions {
 	readonly repeat?: boolean;
 }
 
-/** The client half: the call layer's caller interface, through the proxy. */
-export interface ProxyClient {
+/**
+ * The client half: the call layer's caller interface, through the proxy. It is an `OperationCaller` (EM12): each
+ * ending it gives is one the interface admits, so code written against the interface runs on it unchanged.
+ */
+export interface ProxyClient extends OperationCaller {
 	/** Invokes a named operation through the proxy; exactly one ending, within the bound. */
 	invoke(call: CallRequest): Promise<ProxiedEnding>;
 	/**
@@ -66,7 +69,7 @@ export interface ProxyClient {
 	 * `ready` only when welcomed before the deadline, or already prepared; otherwise the not-delivered ending
 	 * PX2 and PX6 give, which no later `welcome` supersedes.
 	 */
-	prepare(options: PrepareOptions): Promise<"ready" | ProxyNotDeliveredEnding>;
+	prepare(options: PrepareOptions): Promise<"ready" | PreparingEnding>;
 	/** A new invocation identity, as EM11 writes it. */
 	newInvocation(): string;
 	/** Closes the client half's connections; invocations written on them end `unknown` with `proxy-lost`. */
@@ -200,13 +203,13 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 		});
 	};
 
-	const prepare = (prepareOptions: PrepareOptions): Promise<"ready" | ProxyNotDeliveredEnding> => {
+	const prepare = (prepareOptions: PrepareOptions): Promise<"ready" | PreparingEnding> => {
 		if (prepareOptions === null || typeof prepareOptions !== "object" || typeof prepareOptions.timeMs !== "number" || !Number.isFinite(prepareOptions.timeMs)) {
 			throw new TypeError("prepare needs { timeMs }, the finite time left until its deadline in milliseconds");
 		}
 		const { signal } = prepareOptions;
-		const unreachable = (code: ProxyNotDeliveredEnding["proxyCode"]): ProxyNotDeliveredEnding =>
-			proxyNotDelivered(code, prepareOptions.invocation ?? null, prepareOptions.operation ?? null, prepareOptions.repeat === true);
+		const unreachable = (code: PreparingEnding["proxyCode"]): PreparingEnding =>
+			preparingNotDelivered(code, prepareOptions.invocation ?? null, prepareOptions.operation ?? null, prepareOptions.repeat === true);
 		const now = clock.nowNs();
 		if (preparer.current !== undefined) return Promise.resolve("ready");
 		const deadline = now + BigInt(Math.floor(prepareOptions.timeMs * 1e6));

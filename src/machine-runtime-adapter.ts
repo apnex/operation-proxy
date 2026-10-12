@@ -54,11 +54,24 @@ function codeOf(error: unknown): string | undefined {
 	return typeof code === "string" ? code : undefined;
 }
 
-/** Creates the runtime directory when absent, and refuses one PX2 does not allow. */
-export function ensureDirectory(dir: string): void {
-	let stat: fs.Stats;
+/** What a directory's check reads of the system: a path's own status, not following a link, and the user. */
+export interface DirectorySystem {
+	lstat(path: string): Pick<fs.Stats, "isDirectory" | "uid" | "mode">;
+	/** The user this process runs as. */
+	uid(): number | undefined;
+}
+
+/** The machine itself. */
+const MACHINE: DirectorySystem = { lstat: (p) => fs.lstatSync(p), uid: () => process.getuid?.() };
+
+/**
+ * Creates the runtime directory when absent, and refuses one PX2 does not allow. `system` is the machine unless a
+ * test gives another, to check the ownership comparison with a directory of another user it cannot make.
+ */
+export function ensureDirectory(dir: string, system: DirectorySystem = MACHINE): void {
+	let stat: Pick<fs.Stats, "isDirectory" | "uid" | "mode">;
 	try {
-		stat = fs.lstatSync(dir);
+		stat = system.lstat(dir);
 	} catch (error) {
 		if (codeOf(error) !== "ENOENT") throw new RuntimeUnsafe("unusable", `the runtime directory ${dir} cannot be examined`, { cause: error });
 		try {
@@ -69,13 +82,13 @@ export function ensureDirectory(dir: string): void {
 			if (codeOf(made) !== "EEXIST") throw new RuntimeUnsafe("unusable", `the runtime directory ${dir} cannot be created`, { cause: made });
 		}
 		try {
-			stat = fs.lstatSync(dir);
+			stat = system.lstat(dir);
 		} catch (again) {
 			throw new RuntimeUnsafe("unusable", `the runtime directory ${dir} cannot be examined`, { cause: again });
 		}
 	}
 	if (!stat.isDirectory()) throw new RuntimeUnsafe("not-a-directory", `the runtime directory ${dir} is not a directory`);
-	if (stat.uid !== process.getuid?.()) throw new RuntimeUnsafe("not-owned", `the runtime directory ${dir} is not owned by this user`);
+	if (stat.uid !== system.uid()) throw new RuntimeUnsafe("not-owned", `the runtime directory ${dir} is not owned by this user`);
 	if ((stat.mode & 0o077) !== 0) throw new RuntimeUnsafe("open-to-others", `the runtime directory ${dir} grants permissions to its group or to others`);
 }
 

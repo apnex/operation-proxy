@@ -2,21 +2,26 @@
 // while an invocation it carries is in flight (CONTRACT.md, PX7; zorg's E17).
 //
 // Needs Unix sockets: the proxy half runs over a real channel socket on an injected clock, the machine proxy
-// in this process with an injected clock and a temporary runtime directory, and - marked "(processes)" - one
-// real proxy process with an idle time of 1 second.
+// in this process with an injected clock and a temporary runtime directory - at the idle boundary with a raw
+// client as a child process, and with failures injected into its stopping - and - marked "(processes)" - one
+// real proxy process with an idle time of 1 second, and a real client that returns from its program.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { after, test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { keyDigest } from "@apnex/operation-proxy";
 import { startMachineProxyIn } from "../../dist/machine-adapter.js";
+import { machineClock } from "../../dist/machine-clock-adapter.js";
 import { ensureRuntime, ownershipName } from "../../dist/machine-runtime-adapter.js";
 import { createManualHopClock } from "../support/manual-hop-clock.js";
 import { rawConnection, settle, until, watch, withCase } from "../support/case-hop.js";
 import { alive, fixture, sleep, waitFor } from "../support/processes.js";
 import { shortTempDir } from "../support/hop.js";
 
+const CONNECT_MAIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "connect-main.js");
 const fixtures = [];
 after(async () => { for (const f of fixtures) await f.cleanup(); });
 
@@ -117,6 +122,70 @@ function held(name) {
 	});
 }
 
+test("at the idle boundary: a connection the kernel has accepted, not yet taken by the proxy, waiting as the idle timer's first due callback runs, is taken before the proxy checks again, and the same owner stays and serves it", { timeout: 60_000 }, async () => {
+	const dir = path.join(shortTempDir(), "rt");
+	const key = { application: "fixture", identity: `boundary-${process.pid}`, target: "quick" };
+	const idleMs = 1000;
+	// The machine's clock, but the idle timer's wait is held for the test to run when it chooses, the clock's
+	// reading moved past its moment then, so its due callback runs as a real timer callback does.
+	let skew = 0n;
+	const idleWaits = [];
+	const clock = {
+		nowNs: () => machineClock.nowNs() + skew,
+		schedule(delayMs, callback) {
+			if (delayMs !== idleMs) return machineClock.schedule(delayMs, callback);
+			const wait = { callback, cancelled: false };
+			idleWaits.push(wait);
+			return { cancel() { wait.cancelled = true; } };
+		},
+	};
+	const armed = () => idleWaits.filter((w) => !w.cancelled);
+	/** Runs the armed idle wait's due callback from a timer callback, as the runtime runs it, after `before`. */
+	const due = (before = () => undefined) => new Promise((resolve) => setTimeout(() => {
+		const result = before();
+		const [wait] = armed();
+		wait.cancelled = true;
+		skew += BigInt(idleMs) * 1_000_000n;
+		wait.callback();
+		resolve(result);
+	}, 0));
+	const log = [];
+	const proxy = await startMachineProxyIn(dir, quickApplication(key, idleMs, (w) => log.push(w)), { clock, observe: (stage) => log.push(stage) });
+	const name = ownershipName(ensureRuntime(dir), keyDigest(key));
+	const ackDir = shortTempDir();
+	let child;
+	try {
+		await until(() => log.includes("ready") && armed().length === 1, "ready, its idle timer armed");
+		const connected = path.join(ackDir, "connected");
+		const waiting = await due(() => {
+			// Started now, and this thread kept from its event loop - as a loaded proxy's is - until the client
+			// reports its connection made: accepted by the kernel, and not yet taken, since only this thread takes it.
+			child = spawn(process.execPath, [CONNECT_MAIN, path.join(dir, `${keyDigest(key)}.sock`), ackDir, JSON.stringify(key)], { stdio: "ignore" });
+			const end = performance.now() + 20_000;
+			while (!fs.existsSync(connected) && performance.now() < end) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+			return fs.existsSync(connected);
+		});
+		assert.equal(waiting, true, "the kernel had accepted the connection when the idle timer's due callback ran");
+		await waitFor(() => fs.existsSync(path.join(ackDir, "lines.json")), "the client's welcome");
+		assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ackDir, "lines.json"), "utf8")), [{ operationProxy: 1, type: "welcome" }], "welcomed by the same proxy");
+		assert.ok(!log.includes("stopping"), "the proxy did not stop");
+		assert.equal(await held(name), true, "and still owns its key");
+		fs.writeFileSync(path.join(ackDir, "close"), "");
+		await waitFor(() => fs.existsSync(path.join(ackDir, "closed")), "the client's connection closed");
+		await until(() => armed().length === 1, "the idle timer armed again once the connection closed");
+		assert.ok(!log.includes("stopping"));
+		// With nothing waiting, the same owner's next due callback ends it.
+		await due();
+		assert.equal(await proxy.stopped, 0);
+		assert.deepEqual(log.slice(-5), ["stopping", "channel-closed", "caller-stop", "caller-stopped", "stopped"]);
+		assert.equal(await held(name), false);
+	} finally {
+		child?.kill("SIGKILL");
+		fs.rmSync(ackDir, { recursive: true, force: true });
+		fs.rmSync(path.dirname(dir), { recursive: true, force: true });
+	}
+});
+
 test("stopping when idle: it stops accepting, closes connections not welcomed, removes the channel socket, stops its caller, and releases ownership last", async () => {
 	const dir = path.join(shortTempDir(), "rt");
 	const key = { application: "fixture", identity: `idle-${process.pid}`, target: "quick" };
@@ -184,6 +253,77 @@ test("stopping on request, as on SIGTERM, waits for each call in flight to end a
 	readyNow = undefined;
 });
 
+/**
+ * Runs a machine proxy in this process with one failure injected into stopping, and checks that stopping is one
+ * observed shutdown: no unhandled rejection, the caller still stopped, ownership still released, and `stopped`
+ * resolved, with status 1.
+ */
+let faults = 0;
+async function stoppingDespite(what, inject, stop) {
+	const dir = path.join(shortTempDir(), "rt");
+	const key = { application: "fixture", identity: `fault-${process.pid}-${++faults}`, target: "quick" };
+	const clock = createManualHopClock();
+	const log = [];
+	const rejections = [];
+	const unhandled = (reason) => rejections.push(reason);
+	process.on("unhandledRejection", unhandled);
+	const socketPath = path.join(dir, `${keyDigest(key)}.sock`);
+	const restore = inject(socketPath);
+	try {
+		const proxy = await startMachineProxyIn(dir, quickApplication(key, 1000, (w) => log.push(w)), { clock, observe: (stage) => log.push(stage) });
+		const name = ownershipName(ensureRuntime(dir), keyDigest(key));
+		await until(() => log.includes("ready"), "ready");
+		let status;
+		proxy.stopped.then((s) => { status = s; });
+		stop(proxy, clock);
+		await until(() => status !== undefined, `stopped to resolve despite ${what}`);
+		await settle();
+		assert.equal(status, 1, `${what}: the stopped status says a step of stopping failed`);
+		assert.deepEqual(rejections, [], `${what}: no unhandled rejection`);
+		assert.deepEqual(log.slice(4), ["stopping", "channel-closed", "caller-stop", "caller-stopped", "stopped"], `${what}: every later step still ran`);
+		assert.equal(await held(name), false, `${what}: ownership released`);
+	} finally {
+		restore();
+		await settle();
+		process.removeListener("unhandledRejection", unhandled);
+		fs.rmSync(path.dirname(dir), { recursive: true, force: true });
+	}
+}
+
+test("stopping despite a failure to remove the channel socket: the caller still stops, ownership is released, and stopped resolves", async () => {
+	let socket;
+	let failures = 0;
+	await stoppingDespite("an unlink failure", (socketPath) => {
+		socket = socketPath;
+		const rmSync = fs.rmSync;
+		fs.rmSync = (p, ...rest) => {
+			if (p === socket) {
+				failures++;
+				throw Object.assign(new Error("injected unlink failure"), { code: "EACCES" });
+			}
+			return rmSync(p, ...rest);
+		};
+		return () => { fs.rmSync = rmSync; };
+	}, (proxy) => proxy.stop());
+	assert.equal(failures, 1, "the channel socket's removal was tried once, and failed");
+});
+
+test("stopping despite a failure to close the channel's server, and to release ownership cleanly: the caller still stops, ownership is released, and stopped resolves", async () => {
+	for (const which of ["channel", "ownership"]) {
+		await stoppingDespite(`a ${which} close failure`, (socketPath) => {
+			const close = net.Server.prototype.close;
+			net.Server.prototype.close = function (callback) {
+				const address = this.address();
+				const mine = which === "channel" ? address === socketPath : typeof address === "string" && address.startsWith("\0operation-proxy-") && address.endsWith(path.basename(socketPath, ".sock"));
+				if (!mine) return close.call(this, callback);
+				// The server does close; its callback reports a failure, as closing a server can.
+				return close.call(this, () => callback?.(Object.assign(new Error(`injected ${which} close failure`), { code: "EIO" })));
+			};
+			return () => { net.Server.prototype.close = close; };
+		}, (_proxy, clock) => clock.advance(1000));
+	}
+});
+
 test("(processes) one real proxy with an idle time of 1 second ends about 1 second after its last client, exits 0 and removes its channel socket", { timeout: 60_000 }, async () => {
 	const f = fixture({ idleMs: 60_000 });
 	fixtures.push(f);
@@ -197,6 +337,22 @@ test("(processes) one real proxy with an idle time of 1 second ends about 1 seco
 	assert.equal(f.exits().get(pid), 0);
 	assert.ok(!fs.existsSync(f.socketPath()), "the channel socket removed");
 	assert.deepEqual(f.stages().filter((s) => s.pid === pid).map((s) => s.stage).slice(-5), ["stopping", "channel-closed", "caller-stopped", "stopped", "exit"]);
+});
+
+test("(processes) a client that returns from its program after its ending, closing nothing and never calling process.exit, ends by itself; its proxy then idles out", { timeout: 60_000 }, async () => {
+	const f = fixture();
+	fixtures.push(f);
+	const c = f.client({ operation: "which", idleMs: 1000, connectMs: 20_000, natural: true });
+	const ack = await c.ack();
+	assert.equal(ack.ending.ending, "answered");
+	const pid = ack.ending.answer.pid;
+	const exit = await Promise.race([c.exited, sleep(10_000).then(() => "still running")]);
+	assert.deepEqual(exit, { code: 0, signal: null }, "the client ended by itself once its ending was read");
+	assert.ok(alive(pid) || f.reached(pid, "stopping"), "the proxy was not killed with its client");
+	await waitFor(() => !alive(pid), "the proxy to idle out", 20_000);
+	assert.equal(f.exits().get(pid), 0);
+	assert.deepEqual(f.stages().filter((s) => s.pid === pid).map((s) => s.stage).slice(-5), ["stopping", "channel-closed", "caller-stopped", "stopped", "exit"]);
+	assert.ok(!fs.existsSync(f.socketPath()), "the channel socket removed");
 });
 
 test("(processes) a call in flight past the idle time, its client gone, keeps the real proxy running until the call ends", { timeout: 60_000 }, async () => {

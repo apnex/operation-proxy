@@ -2,7 +2,8 @@
 // <ack-file> <call.json>`. It builds the client half, prepares it within the call's `connectMs` (by default
 // zorg's connect timeout of 5 seconds) unless `connectMs` is null, and then, unless the call is `prepareOnly`
 // or preparing ended it, invokes the call - and acknowledges by writing the ending, with its own process id, to the ack file, renamed into
-// place whole, which the test polls; then it exits. Its proxy is launched as `proxy-main.js` with the same
+// place whole, which the test polls; then it closes the client half and exits, or, for a call marked `natural`,
+// simply returns. Its proxy is launched as `proxy-main.js` with the same
 // configuration, the call's `idleMs` given on the command line when it holds one (PX9).
 import fs from "node:fs";
 import path from "node:path";
@@ -30,5 +31,9 @@ if (call.writtenFile) fs.writeFileSync(call.writtenFile, String(process.pid));
 const ending = prepared !== "ready" || call.prepareOnly ? prepared
 	: await client.invoke({ host: "host-a", service: call.service ?? "fixture", operation: call.operation, input: call.input ?? {}, bound: call.bound ?? 5000 });
 ack({ ending, preparedMs, elapsedMs: performance.now() - started });
-client.close();
-process.exit(0);
+// A call marked `natural` returns from the program as a short-lived command does, closing nothing and forcing
+// no exit: the process ends only if nothing of the client half still holds it.
+if (!call.natural) {
+	client.close();
+	process.exit(0);
+}

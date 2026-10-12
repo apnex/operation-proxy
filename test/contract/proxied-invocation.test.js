@@ -11,15 +11,18 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { after, test } from "node:test";
+import { createCaller } from "@apnex/operation-call";
 import { createProxyClient } from "@apnex/operation-proxy";
 import { messageBytes, writeRequest } from "@apnex/operation-call/message-format";
 import { connectChannel } from "../../dist/machine-channel-adapter.js";
 import { machineClock, machineIdentities } from "../../dist/machine-clock-adapter.js";
-import { ns, openCase, rawConnection, settle, until, watch, withCase } from "../support/case-hop.js";
+import { ns, openCase, rawConnection, rawProxy, settle, until, watch, withCase } from "../support/case-hop.js";
 import { KEY } from "../support/hop.js";
+import { openTopology } from "../support/topology.js";
 import { fixture, PROXY_MAIN, sleep, waitFor } from "../support/processes.js";
 
 const LINE = 16785408;
+const NOT_SENDABLE = { part: "operation-call", code: "not-sendable", what: "The request would nest more than 30 levels, hold an integer more than 9007199254740991 from zero, or exceed 16777216 bytes as JSON.", why: "AGP carries no such message to any peer, so the request was not sent.", fix: "Make the input shallower, keep every integer within 9007199254740991 of zero, or send less, then call again.", details: {} };
 const REFUSAL = { part: "fixture-store", code: "revision-moved", what: "The revision moved.", why: "Another write landed first.", fix: "Read again, then write.", details: {} };
 
 /** Asserts the client half's ending is exactly the ending of the direct call the proxy made (D48). */
@@ -191,6 +194,103 @@ test("PX4, PX6: an end the proxy writes that breaks the table closes the channel
 	});
 });
 
+/** The ending the client half gives an invocation written on a channel that closed or broke the table (PX6). */
+const proxyLost = (ending) => ({ ending: "unknown", invocation: ending.invocation, attempt: null, operation: ending.operation, reason: "proxy-lost", agpCode: null, deliveryReport: null });
+
+/** Raw JSON text nesting `levels` arrays around 0. */
+const nestedText = (levels) => `${"[".repeat(levels)}0${"]".repeat(levels)}`;
+
+test("PX4, PX6: an end whose answer or refusal breaks the call layer's JSON, number or depth rules, read from the real wire, breaks the table: the channel closes and the invocation ends unknown with proxy-lost; values at the rules' edges are taken", { timeout: 60_000 }, async () => {
+	// Raw text a JSON encoder never writes: what a broken or hostile peer can put on the channel.
+	const answered = (invoke, answer) => `{"ending":"answered","invocation":"${invoke.invocation}","attempt":"${invoke.invocation}.0000abcd","operation":"${invoke.operation}","answer":${answer}}`;
+	const refused = (invoke, details) => `{"ending":"refused","invocation":"${invoke.invocation}","attempt":"${invoke.invocation}.0000abcd","operation":"${invoke.operation}","refusal":{"part":"p","code":"c","what":"w","why":"y","fix":"f","details":${details}}}`;
+	const breaking = [
+		["an infinite answer", (i) => answered(i, "1e400")],
+		["a negative infinite answer", (i) => answered(i, "-1e400")],
+		["an infinite number nested in the answer", (i) => answered(i, '{"a":[1,{"b":1e400}]}')],
+		["an unsafe integer, one more than 9007199254740991", (i) => answered(i, "9007199254740992")],
+		["an unsafe negative integer", (i) => answered(i, "-9007199254740992")],
+		["an unsafe integer nested in the answer", (i) => answered(i, '[0,{"n":9007199254740993}]')],
+		["a large number that is an integer beyond the safe range", (i) => answered(i, "1e300")],
+		["an answer of 30 levels, its end message 31", (i) => answered(i, nestedText(30))],
+		["an answer of 100000 levels", (i) => answered(i, nestedText(100_000))],
+		["a refusal whose details hold an infinite number", (i) => refused(i, '{"n":1e400}')],
+		["a refusal whose details hold an unsafe integer", (i) => refused(i, '{"n":[9007199254740992]}')],
+		["a refusal whose details nest 29 levels, its end message 31", (i) => refused(i, `{"n":${nestedText(28)}}`)],
+	];
+	const taken = [
+		["the largest safe integer", (i) => answered(i, "9007199254740991"), 9007199254740991],
+		["the smallest safe integer", (i) => answered(i, "-9007199254740991"), -9007199254740991],
+		["a fraction", (i) => answered(i, "1e-300"), 1e-300],
+		["an answer of 29 levels, its end message 30", (i) => answered(i, nestedText(29)), JSON.parse(nestedText(29))],
+	];
+	const all = [...breaking, ...taken];
+	const proxy = await rawProxy((invoke, line) => line(`{"operationProxy":1,"type":"end","request":${invoke.request},"ending":${all[invoke.input][1](invoke)}}`));
+	try {
+		for (const [n, [what]] of all.entries()) {
+			const client = proxy.client(machineClock);
+			const closes = proxy.closes();
+			const ending = await client.invoke({ host: "host-a", service: "fixture", operation: "echo", input: n, bound: 10_000 });
+			if (n < breaking.length) {
+				assert.deepEqual(ending, proxyLost(ending), what);
+				await until(() => proxy.closes() === closes + 1, `${what}: the channel closed`);
+			} else {
+				assert.equal(ending.ending, "answered", what);
+				assert.deepEqual(ending.answer, all[n][2], what);
+				assert.ok(Object.isFrozen(ending), `${what}: frozen`);
+				client.close();
+				await until(() => proxy.closes() === closes + 1, `${what}: closed by the test`);
+			}
+		}
+	} finally {
+		await proxy.close();
+	}
+});
+
+test("PX4, PX6: an end for a request the client never wrote, or naming another invocation or another operation, breaks the table: the channel closes and the invocation written ends unknown with proxy-lost", async () => {
+	const ends = [
+		["a request the client never wrote", (i) => ({ request: i.request + 1, ending: { ending: "answered", invocation: i.invocation, attempt: `${i.invocation}.0000abcd`, operation: i.operation, answer: 1 } })],
+		["another invocation", (i) => ({ request: i.request, ending: { ending: "answered", invocation: "1791540000000-0123456789abcdee", attempt: "1791540000000-0123456789abcdee.0000abcd", operation: i.operation, answer: 1 } })],
+		["an attempt of another invocation", (i) => ({ request: i.request, ending: { ending: "answered", invocation: i.invocation, attempt: "1791540000000-0123456789abcdee.0000abcd", operation: i.operation, answer: 1 } })],
+		["another operation", (i) => ({ request: i.request, ending: { ending: "answered", invocation: i.invocation, attempt: `${i.invocation}.0000abcd`, operation: "which", answer: 1 } })],
+	];
+	const proxy = await rawProxy((invoke, line) => line(JSON.stringify({ operationProxy: 1, type: "end", ...ends[invoke.input][1](invoke) })));
+	try {
+		for (const [n, [what]] of ends.entries()) {
+			const closes = proxy.closes();
+			const ending = await proxy.client(machineClock).invoke({ host: "host-a", service: "fixture", operation: "echo", input: n, bound: 10_000 });
+			assert.deepEqual(ending, proxyLost(ending), what);
+			await until(() => proxy.closes() === closes + 1, `${what}: the channel closed`);
+		}
+	} finally {
+		await proxy.close();
+	}
+});
+
+test("PX4: a client message after hello while welcome is held breaks the table: the proxy closes the connection, never welcomes it, and hands nothing on", async () => {
+	const readiness = Promise.withResolvers();
+	await withCase({ readiness: readiness.promise }, async (c) => {
+		const waiting = [];
+		for (const next of [rawInvoke(c), { operationProxy: 1, type: "abort", request: 1 }, { operationProxy: 1, type: "hello", key: KEY }]) {
+			const raw = await rawConnection(c.hop.socketPath);
+			raw.send({ operationProxy: 1, type: "hello", key: KEY });
+			await until(() => c.hop.half.connections() === waiting.length + 1, "the hello read, its welcome held");
+			raw.send(next);
+			await until(raw.closed, `a ${next.type} after hello, before welcome, closes the connection`);
+			assert.deepEqual(raw.lines, [], `a ${next.type}: nothing written back`);
+			await until(() => c.hop.half.connections() === waiting.length, "the connection gone from the proxy");
+		}
+		const patient = await rawConnection(c.hop.socketPath);
+		patient.send({ operationProxy: 1, type: "hello", key: KEY });
+		await until(() => c.hop.half.connections() === 1, "a client that waits");
+		readiness.resolve();
+		await until(() => patient.lines.length === 1, "its welcome");
+		assert.deepEqual(patient.lines, [{ operationProxy: 1, type: "welcome" }], "a client that sent nothing more is welcomed once the caller is ready");
+		assert.equal(c.calls.length, 0, "nothing was handed on");
+		patient.end();
+	});
+});
+
 // ---------------------------------------------------------------------------------------------------------
 // PX5 - preparing, the bound, and when a proxied call is made.
 
@@ -224,6 +324,30 @@ test("PX5: a request message of exactly 16777216 bytes is written and handed on,
 		assert.equal((await c.ended({ operation: "echo", input: 2 ** 60 })).refusal.code, "not-sendable", "an unsafe integer, refused before writing");
 		assert.equal(c.invokes().length, invokes + 1, "only the small call after it was written since");
 	});
+});
+
+test("PX5: a host so long that the invocation would not fit a line is refused not-sendable with nothing written, where the same call made directly meets AGP's own refusal, not delivered", { timeout: 120_000 }, async () => {
+	const host = "h".repeat(LINE);
+	await withCase({}, async (c) => {
+		const ending = await c.ended({ host, operation: "echo", input: {}, bound: 100_000 });
+		assert.deepEqual(ending, { ending: "refused", invocation: ending.invocation, attempt: ending.attempt, operation: "echo", refusal: NOT_SENDABLE });
+		assert.ok(ending.attempt.startsWith(`${ending.invocation}.`), "refused under an attempt identity, as the call layer refuses");
+		assert.equal(c.invokes().length, 0, "nothing of it was written");
+		assert.equal(c.calls.length, 0, "and nothing handed on");
+		assert.equal((await c.ended({ operation: "echo", input: "after" })).answer, "after", "the client half carries the next call");
+	});
+	const t = await openTopology();
+	const direct = await createCaller({ node: t.sendingNode });
+	try {
+		const ending = await direct.invoke({ host, service: "fixture", operation: "echo", input: {}, bound: 100_000 });
+		assert.equal(ending.ending, "not-delivered", "a direct call is handed to AGP, which refuses it");
+		assert.equal(typeof ending.agpCode, "string", "AGP's own code");
+		assert.equal(ending.proxyCode, null);
+		assert.equal(ending.refusal, undefined, "never the call layer's not-sendable refusal");
+	} finally {
+		await direct.close();
+		await t.close();
+	}
 });
 
 test("PX5: a hop delayed in each direction: the call is made when the proxy hands it on, its bound the deadline less the proxy's reading, rounded down; a return within the allowance is taken", async () => {
@@ -732,6 +856,33 @@ test("PX6: an application allowance of 0, whose invocation runs out its bound, e
 			seen.add(ending.reason);
 		}
 		assert.ok(seen.size >= 1);
+	});
+});
+
+test("PX6: a proxy whose caller throws or rejects a programming error for an invocation - the call layer's answer to a call that skipped the client half's checks - sends nothing for it, and the client half's deadline ends it hop-stalled", async () => {
+	const wrapCaller = (recording) => ({
+		invoke(call) {
+			if (call.input === "throws") throw new TypeError("a programming error, thrown");
+			if (call.input === "rejects") return Promise.reject(new TypeError("a programming error, rejected"));
+			return recording.invoke(call);
+		},
+	});
+	await withCase({ wrapCaller }, async (c) => {
+		for (const [n, how] of ["throws", "rejects"].entries()) {
+			const call = watch(c.call({ operation: "echo", input: how, bound: 1000 }));
+			await until(() => c.invokes().length === n + 1, `the ${how} invocation written`);
+			await until(() => c.hop.half.inFlight() === 0, `the ${how} call over`);
+			await settle();
+			assert.equal(c.hop.sent("end").length, 0, `nothing sent for the call that ${how}`);
+			c.clock.advance(999);
+			await settle();
+			assert.ok(!call.settled(), `${how}: nothing decides it before the client half's deadline`);
+			c.clock.advance(1);
+			await until(call.settled, `${how}: the client half's deadline`);
+			assert.deepEqual(call.value(), { ending: "unknown", invocation: call.value().invocation, attempt: null, operation: "echo", reason: "hop-stalled", agpCode: null, deliveryReport: null }, how);
+		}
+		assert.equal((await c.ended({ operation: "echo", input: "next" })).answer, "next", "the connection carries the next invocation");
+		assert.equal(c.hop.half.connections(), 1, "on the same connection");
 	});
 });
 

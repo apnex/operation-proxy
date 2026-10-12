@@ -1,5 +1,7 @@
 // client-half - the client half's decisions over links a test drives, on an injected clock (CONTRACT.md, PX5,
-// PX6): which of PX6's events decides, by the clock as each is read. Needs no socket.
+// PX6): which of PX6's events decides, by the clock as each is read; and that a connection holds its process
+// only while an invocation written on it waits, so a short-lived process ends once its endings are read.
+// Needs no socket.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createProxyClient } from "@apnex/operation-proxy";
@@ -22,7 +24,8 @@ function drivenConnector({ unsafe = false } = {}) {
 					handlers, written: [], open: true, writable: true,
 					write(message) { if (!link.writable) return false; link.written.push(message); return true; },
 					close() { if (!link.open) return; link.open = false; queueMicrotask(() => handlers.closed()); },
-					hold() {},
+					holds: [],
+					hold(keep) { link.holds.push(keep); },
 				};
 				links.push(link);
 				return { kind: "connected", link };
@@ -146,4 +149,90 @@ test("an abort given while preparing crosses with the invoke as aborted, and one
 	d.links[0].handlers.message(answered(d.links[0].written[2]));
 	assert.equal((await first).answer, "yes");
 	assert.equal((await second).answer, "yes");
+});
+
+/** Prepares a client half over a driven connector and gives its welcomed link. */
+async function welcomed(c, d) {
+	const p = c.prepare({ timeMs: 1000 });
+	await turns();
+	d.links.at(-1).handlers.message(welcome);
+	assert.equal(await p, "ready");
+	return d.links.at(-1);
+}
+
+/** Whether a link last asked to hold its process: true while held, false once let go. */
+const holding = (link) => link.holds.at(-1);
+
+test("one normal ending releases the connection's hold on its process, which a welcomed connection without invocations never had", async () => {
+	const clock = createManualHopClock();
+	const d = drivenConnector();
+	const c = client(d.connector, clock);
+	const link = await welcomed(c, d);
+	assert.equal(holding(link), false, "welcomed and idle: not held");
+	const pending = call(c);
+	await turns();
+	assert.equal(holding(link), true, "held while the invocation waits");
+	link.handlers.message(answered(link.written[1]));
+	assert.equal((await pending).answer, "yes");
+	assert.equal(holding(link), false, "let go once its ending is read");
+	assert.deepEqual(link.holds.slice(-2), [true, false]);
+	assert.equal(link.open, true, "the connection stays open for the next invocation");
+});
+
+test("several normal endings read out of order release the hold only when the last is read, once", async () => {
+	const clock = createManualHopClock();
+	const d = drivenConnector();
+	const c = client(d.connector, clock);
+	const link = await welcomed(c, d);
+	const pending = [call(c, { input: 1 }), call(c, { input: 2 }), call(c, { input: 3 })];
+	await turns();
+	const invokes = link.written.filter((m) => m.type === "invoke");
+	assert.equal(invokes.length, 3);
+	const before = link.holds.length;
+	for (const i of [2, 0]) {
+		link.handlers.message(answered(invokes[i]));
+		await turns();
+		assert.equal(holding(link), true, `held while another waits, after the end of request ${invokes[i].request}`);
+	}
+	link.handlers.message(answered(invokes[1]));
+	for (const p of pending) assert.equal((await p).answer, "yes");
+	assert.equal(holding(link), false);
+	assert.deepEqual(link.holds.slice(before).filter((h) => h === false), [false], "let go exactly once");
+	assert.equal(link.open, true);
+});
+
+test("an invocation ended at its deadline releases the hold; its later end is a late end, discarded, and the connection carries the next", async () => {
+	const clock = createManualHopClock();
+	const d = drivenConnector();
+	const c = client(d.connector, clock);
+	const link = await welcomed(c, d);
+	const timedOut = call(c, { bound: 100 });
+	const waiting = call(c, { bound: 10_000 });
+	await turns();
+	const [first, second] = link.written.filter((m) => m.type === "invoke");
+	clock.advance(100);
+	const stalled = await timedOut;
+	assert.deepEqual([stalled.ending, stalled.reason], ["unknown", "hop-stalled"]);
+	assert.equal(holding(link), true, "still held: another invocation waits");
+	link.handlers.message(answered(first));
+	await turns();
+	assert.equal(link.open, true, "a late end for a request written on the connection fits the table");
+	assert.equal(holding(link), true, "the late end changes nothing");
+	link.handlers.message(answered(second));
+	assert.equal((await waiting).answer, "yes");
+	assert.equal(holding(link), false, "let go once the last waiting ending is read");
+	const alone = call(c, { bound: 100 });
+	await turns();
+	const third = link.written.filter((m) => m.type === "invoke")[2];
+	assert.equal(holding(link), true);
+	clock.advance(100);
+	assert.equal((await alone).reason, "hop-stalled");
+	assert.equal(holding(link), false, "an invocation ended by its deadline alone lets go");
+	link.handlers.message(answered(third));
+	await turns();
+	assert.equal(holding(link), false, "and its late end changes nothing");
+	assert.equal(link.open, true);
+	link.handlers.message(answered(third));
+	await turns();
+	assert.equal(link.open, false, "a second end for the same request is for a request no longer written: it breaks the table");
 });

@@ -89,25 +89,38 @@ export class Connection {
 		if (this.#open) this.link.write(writeAbort(request));
 	}
 
-	/** The invocation of a request decided its ending; the connection holds its process only while one waits. */
+	/**
+	 * The invocation of a request decided its ending; the connection holds its process only while one waits.
+	 * Idempotent: a request already decided, or whose `end` was already read, changes nothing.
+	 */
 	decided(request: number): void {
 		const entry = this.#asked.get(request);
-		if (entry === undefined || entry.decided) return;
+		if (entry !== undefined) this.#release(entry);
+	}
+
+	/** Releases a request's part in holding the process, once, while its entry is still present. */
+	#release(entry: { decided: boolean }): void {
+		if (entry.decided) return;
 		entry.decided = true;
 		if (--this.#waiting === 0) this.link.hold(false);
 	}
 
-	/** A message read once welcomed: only an `end` for a request written and not yet ended fits the table. */
+	/**
+	 * A message read once welcomed: only an `end` for a request written and not yet ended fits the table. Reading
+	 * it decides the request - taken, or discarded as late - so its accounting is released before its entry is
+	 * removed; an `end` for a request already decided, by its deadline, is a late end, discarded.
+	 */
 	readonly message = (value: unknown): void => {
 		if (!this.#open) return;
 		const end = readEnd(value, (request) => this.#asked.get(request)?.written);
-		if (end === undefined) {
+		const entry = end === undefined ? undefined : this.#asked.get(end.request);
+		if (end === undefined || entry === undefined) {
 			this.link.close();
 			return;
 		}
-		const entry = this.#asked.get(end.request);
+		this.#release(entry);
 		this.#asked.delete(end.request);
-		entry?.written.ended(end.ending);
+		entry.written.ended(end.ending);
 	};
 
 	/** The connection closed: every invocation written on it and still waiting is lost. */
@@ -117,6 +130,7 @@ export class Connection {
 		this.gone(this);
 		const entries = [...this.#asked.values()];
 		this.#asked.clear();
+		this.#waiting = 0;
 		for (const entry of entries) entry.written.lost();
 	};
 }

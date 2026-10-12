@@ -2,9 +2,14 @@
 // half and the proxy half in one process over a real channel socket, on a manual hop clock unless the case
 // gives another, with fixture hosts on both host nodes - host-a serving under `fixture` and `other` - and every
 // fixture operation ready to call. Needs Unix sockets.
+import fs from "node:fs";
 import net from "node:net";
+import path from "node:path";
+import { createProxyClient } from "@apnex/operation-proxy";
+import { connectChannel } from "../../dist/machine-channel-adapter.js";
+import { machineIdentities } from "../../dist/machine-clock-adapter.js";
 import { readyAll, openFixtureHost } from "./fixture-hosts.js";
-import { openHop } from "./hop.js";
+import { KEY, openHop, shortTempDir } from "./hop.js";
 import { createManualHopClock, ns } from "./manual-hop-clock.js";
 
 export { ns };
@@ -102,5 +107,52 @@ export async function rawConnection(socketPath) {
 		write: (text) => socket.write(text),
 		send: (message) => socket.write(`${JSON.stringify(message)}\n`),
 		end: () => socket.destroy(),
+	};
+}
+
+/**
+ * A raw proxy on a channel socket of its own, for the cases about what the client half reads and closes on
+ * (PX4, PX6): it welcomes each `hello`, and gives each `invoke` to `answer(invoke, line)`, where `line(text)`
+ * writes raw text as one line, so a case can write what no JSON encoder writes, `1e400` among it. It counts
+ * the connections that closed. `client(clock)` builds a client half reaching it.
+ */
+export async function rawProxy(answer) {
+	const dir = shortTempDir();
+	const socketPath = path.join(dir, "raw.sock");
+	const sockets = new Set();
+	let closes = 0;
+	const server = net.createServer((socket) => {
+		sockets.add(socket);
+		socket.on("close", () => { sockets.delete(socket); closes++; });
+		socket.on("error", () => undefined);
+		socket.setEncoding("utf8");
+		let rest = "";
+		socket.on("data", (text) => {
+			rest += text;
+			let i;
+			while ((i = rest.indexOf("\n")) >= 0) {
+				const message = JSON.parse(rest.slice(0, i));
+				rest = rest.slice(i + 1);
+				if (message.type === "hello") socket.write(`${JSON.stringify({ operationProxy: 1, type: "welcome" })}\n`);
+				else if (message.type === "invoke") answer(message, (line) => socket.write(`${line}\n`));
+			}
+		});
+	});
+	await new Promise((resolve) => server.listen(socketPath, resolve));
+	const clients = [];
+	return {
+		socketPath,
+		closes: () => closes,
+		client(clock) {
+			const client = createProxyClient({ key: KEY, clock, identities: machineIdentities, connector: { connect: (h) => connectChannel(socketPath, h), launch: () => undefined } });
+			clients.push(client);
+			return client;
+		},
+		async close() {
+			for (const client of clients) client.close();
+			for (const socket of sockets) socket.destroy();
+			await new Promise((resolve) => server.close(resolve));
+			fs.rmSync(dir, { recursive: true, force: true });
+		},
 	};
 }

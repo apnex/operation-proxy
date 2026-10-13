@@ -12,8 +12,9 @@
  * flight has ended and its ending has been sent, the proxy stops accepting connections, closes those not
  * welcomed and then the rest, closes and removes the channel socket, stops its caller, and stops listening on
  * the ownership socket last, so the next owner can take the key only after the last step. A start that fails
- * after taking ownership - an observer throwing at `owned` or `listening` included - closes what it opened, the
- * channel's server and then ownership, before its failure is given, so a later start in this process owns the key.
+ * after taking ownership - an observer throwing at `owned` or `listening`, or a clock reading failing, included -
+ * stops its idle timer and closes what it opened, its connections, the channel's server and then ownership, before
+ * its failure is given, so a later start in this process owns the key.
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -21,7 +22,7 @@ import net from "node:net";
 import type { CallClock, IdentitySource } from "@apnex/operation-call";
 import type { LinkHandlers } from "./channel-link.js";
 import { createProxyClient, checkHopAllowance, DEFAULT_HOP_ALLOWANCE_MS, type ProxyClient } from "./client-half.js";
-import { callClockOf, type HopClock } from "./hop-clock.js";
+import { callClockOf, type HopClock, type PinnableCallClock } from "./hop-clock.js";
 import { checkKey, keyDigest, type ProxyKey } from "./key.js";
 import { connectChannel, listenChannel, socketLink } from "./machine-channel-adapter.js";
 import { machineClock, machineIdentities } from "./machine-clock-adapter.js";
@@ -187,6 +188,11 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	let resolveStopped!: (status: number) => void;
 	const stopped = new Promise<number>((resolve) => { resolveStopped = resolve; });
 	let half: ProxyHalf | undefined;
+	/**
+	 * The one shutdown, or the undoing of a failed start: it exists before any timer or callback that can start it
+	 * is armed, so one firing at any moment finds it (PX7).
+	 */
+	let shutdown: Promise<void> | undefined;
 	const accept = (socket: net.Socket): void => {
 		if (stopping || half === undefined) {
 			socket.destroy();
@@ -203,22 +209,24 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	if (ownership === undefined) return Object.freeze({ owner: false, stopped: Promise.resolve(0), stop: () => undefined });
 	const held: net.Server = ownership;
 	let server: net.Server | undefined;
+	let callClock: PinnableCallClock;
 	try {
 		observe("owned");
 		removeLeftover(socketPath);
 		server = await listenChannel(socketPath, accept);
 		half = createProxyHalf({ key, clock, idleMs, onIdle: () => void stopNow(0) });
 		observe("listening");
+		// The call clock reads the clock for its origin, so a clock that fails here fails the start (PX7).
+		callClock = callClockOf(clock);
 	} catch (error) {
-		// A start that fails after taking ownership closes what it opened - the channel's server, and then
-		// ownership - before its failure is given, so a later start, in this process or another, owns the key (PX7).
+		// A start that fails after taking ownership - at any step, a clock reading included - stops its idle timer,
+		// closes its connections, the channel's server and then ownership, before its failure is given, so a later
+		// start, in this process or another, owns the key (PX7).
 		await unstart(server, half);
 		throw error;
 	}
 	const channel: net.Server = server;
 	const proxyHalf: ProxyHalf = half;
-
-	const callClock = callClockOf(clock);
 	let built: ProxiedCaller | undefined;
 	const building = (async () => {
 		built = await application.buildCaller(key, { clock: callClock });
@@ -239,6 +247,8 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	 */
 	async function unstart(opened: net.Server | undefined, made: ProxyHalf | undefined): Promise<void> {
 		stopping = true;
+		// No shutdown follows a start undone: an idle timer firing after this starts nothing.
+		shutdown = Promise.resolve();
 		const step = async (action: () => unknown): Promise<void> => {
 			try {
 				await action();
@@ -261,7 +271,6 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	 * built or made ready, and never rejecting, so no path that starts it leaves a rejection unobserved. It ends
 	 * with `stopped` resolved, whatever step failed.
 	 */
-	let shutdown: Promise<void> | undefined;
 	function stopNow(status: number): Promise<void> {
 		if (shutdown === undefined) {
 			stopping = true;

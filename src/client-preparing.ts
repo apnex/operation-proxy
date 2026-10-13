@@ -63,7 +63,7 @@ export class Connection {
 	#next = 1;
 	#waiting = 0;
 	/** Every request written and not yet ended by an `end`, decided or not. */
-	readonly #asked = new Map<number, { readonly written: WrittenInvocation; decided: boolean }>();
+	readonly #asked = new Map<number, Asked>();
 
 	constructor(readonly link: ChannelLink, private readonly gone: (connection: Connection) => void) {}
 
@@ -74,20 +74,47 @@ export class Connection {
 	/**
 	 * Writes an invocation under the next request number; the number, or undefined when the connection was
 	 * already closed and nothing of it was written.
+	 *
+	 * The invocation is counted as waiting, and the connection held, before the channel's write is given it,
+	 * since a channel may deliver its `end`, or the connection's close, during that write (PX4). Nothing written,
+	 * that is undone once; an `end` read during the write has already released it; a close reported during the
+	 * write leaves the invocation's outcome to this method, which knows whether anything of it was written.
 	 */
 	write(written: WrittenInvocation, fields: Omit<InvokeFields, "request">): number | undefined {
 		if (!this.#open) return undefined;
 		const request = this.#next++;
-		this.#asked.set(request, { written, decided: false });
-		if (!this.link.write(writeInvoke({ request, ...fields }))) {
+		const entry: Asked = { written, decided: false, writing: true };
+		this.#asked.set(request, entry);
+		this.#waiting++;
+		this.link.hold(true);
+		let wrote: boolean;
+		try {
+			wrote = this.link.write(writeInvoke({ request, ...fields }));
+		} catch (error) {
+			this.#undo(request, entry);
+			throw error;
+		}
+		entry.writing = false;
+		if (!wrote) {
 			// The connection is already closed, though its closing may not yet have been reported.
-			this.#asked.delete(request);
+			this.#undo(request, entry);
 			this.closed();
 			return undefined;
 		}
-		this.#waiting++;
-		this.link.hold(true);
+		// Written, and the connection closed as it was written: the invocation is lost (PX6).
+		if (!this.#open && !entry.told) {
+			entry.told = true;
+			entry.written.lost();
+		}
 		return request;
+	}
+
+	/** Undoes, once, an invocation's waiting and its entry, when nothing of it was written. */
+	#undo(request: number, entry: Asked): void {
+		entry.writing = false;
+		entry.told = true;
+		if (this.#asked.get(request) === entry) this.#asked.delete(request);
+		this.#release(entry);
 	}
 
 	/** Relays an abort for a request written on this connection. */
@@ -126,6 +153,7 @@ export class Connection {
 		}
 		this.#release(entry);
 		this.#asked.delete(end.request);
+		entry.told = true;
 		entry.written.ended(end.ending);
 	};
 
@@ -136,9 +164,28 @@ export class Connection {
 		this.gone(this);
 		const entries = [...this.#asked.values()];
 		this.#asked.clear();
+		for (const entry of entries) entry.decided = true;
+		const held = this.#waiting > 0;
 		this.#waiting = 0;
-		for (const entry of entries) entry.written.lost();
+		if (held) guarded(() => this.link.hold(false));
+		// One being written is left to write, which knows whether anything of it was written.
+		for (const entry of entries) {
+			if (entry.writing || entry.told) continue;
+			entry.told = true;
+			entry.written.lost();
+		}
 	};
+}
+
+/** A request written, or being written, on a connection and not yet ended by an `end`. */
+interface Asked {
+	readonly written: WrittenInvocation;
+	/** Its part in holding the process has been released. */
+	decided: boolean;
+	/** The channel's write has been given it and has not yet returned. */
+	writing: boolean;
+	/** Its invocation has been told its `end` or its loss, or nothing of it was written: it is told nothing more. */
+	told?: boolean;
 }
 
 /** What a waiter learns. */

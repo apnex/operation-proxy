@@ -5,19 +5,21 @@
 // Needs Unix sockets throughout: most cases run the client half and the proxy half in this process over a real
 // channel socket, on a manual hop clock, the proxy's caller operation-call's own over AGP's production
 // in-process carrier, every direct call the proxy makes recorded - its moment, bound and abort - and the
-// ending checked against it. The cases marked "(processes)" also run the proxy as a real child process.
+// ending checked against it. The cases marked "(processes)" also run the proxy as a real child process. Three
+// PX4 cases instead join the public halves by a channel that delivers each message within the write sending it.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { after, test } from "node:test";
 import { createCaller } from "@apnex/operation-call";
-import { createProxyClient } from "@apnex/operation-proxy";
+import { callClockOf, createProxyClient, createProxyHalf } from "@apnex/operation-proxy";
 import { messageBytes, writeRequest } from "@apnex/operation-call/message-format";
 import { connectChannel } from "../../dist/machine-channel-adapter.js";
 import { machineClock, machineIdentities } from "../../dist/machine-clock-adapter.js";
 import { ns, openCase, rawConnection, rawProxy, settle, until, watch, withCase } from "../support/case-hop.js";
 import { KEY } from "../support/hop.js";
+import { createManualHopClock } from "../support/manual-hop-clock.js";
 import { openTopology } from "../support/topology.js";
 import { fixture, PROXY_MAIN, sleep, waitFor } from "../support/processes.js";
 
@@ -289,6 +291,191 @@ test("PX4: a client message after hello while welcome is held breaks the table: 
 		assert.equal(c.calls.length, 0, "nothing was handed on");
 		patient.end();
 	});
+});
+
+/**
+ * The public halves joined by a channel that delivers each message synchronously, inside the write that sends it,
+ * as a channel over any carrier may (PX1, PX4). `duringInvoke(n)` is asked, as the client half's nth invoke is
+ * written, whether to move the clock first (`move`, in ms), to close the connection instead of writing it
+ * (`closeUnwritten`: the write then returns false), or to close it once written (`closeWritten`). The proxy's
+ * caller holds each call until the test answers it. Each link records its holds and the invokes the proxy read.
+ */
+function synchronousChannel(duringInvoke = () => ({})) {
+	const clock = createManualHopClock();
+	const calls = [];
+	const caller = { invoke: (call) => new Promise((resolve) => calls.push({ call, answer: () => resolve({ ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000000`, operation: call.operation, answer: call.input }) })) };
+	const half = createProxyHalf({ key: KEY, clock, idleMs: 1000, onIdle: () => undefined });
+	half.ready(caller, callClockOf(clock));
+	const links = [];
+	let invokes = 0;
+	const client = createProxyClient({
+		key: KEY, clock, identities: machineIdentities,
+		connector: {
+			async connect(clientHandlers) {
+				let open = true;
+				const record = { holds: [], invokesRead: 0 };
+				links.push(record);
+				const wire = (m) => JSON.parse(JSON.stringify(m));
+				let proxyHandlers;
+				const close = () => {
+					if (!open) return;
+					open = false;
+					proxyHandlers.closed();
+					clientHandlers.closed();
+				};
+				proxyHandlers = half.accept({ write: (m) => { if (!open) return false; clientHandlers.message(wire(m)); return true; }, close, hold: () => undefined });
+				return {
+					kind: "connected",
+					link: {
+						write(m) {
+							if (!open) return false;
+							if (m.type !== "invoke") {
+								proxyHandlers.message(wire(m));
+								return true;
+							}
+							const plan = duringInvoke(++invokes);
+							if (plan.move !== undefined) clock.move(plan.move);
+							if (plan.closeUnwritten) {
+								close();
+								return false;
+							}
+							record.invokesRead++;
+							proxyHandlers.message(wire(m));
+							if (plan.closeWritten) close();
+							return true;
+						},
+						hold: (keep) => record.holds.push(keep),
+						close,
+					},
+				};
+			},
+			launch: () => undefined,
+		},
+	});
+	/** Each ending, and how many times its promise settled. */
+	const invoke = (call) => {
+		const outcome = { settled: 0, ending: undefined };
+		outcome.done = client.invoke({ host: "host-a", service: "fixture", operation: "echo", input: null, ...call }).then((ending) => { outcome.settled++; outcome.ending = ending; return ending; });
+		return outcome;
+	};
+	return { clock, half, client, calls, links, invoke, close: () => { client.close(); half.stopIdle(); } };
+}
+
+/** Whether a link last asked to hold its process: true while held, false once let go. */
+const holding = (record) => record.holds.at(-1);
+
+test("PX4: over a channel delivering synchronously, a deadline-passed refusal read during the invoke's own write ends it once; the link is then not held, and the count of waiting invocations is not below zero: the next invocation holds it and lets it go", { timeout: 30_000 }, async () => {
+	// Bound 2 ms, allowance 1 ms: 0.25 ms of outbound transit leaves the proxy under 1 ms, so it refuses at once.
+	const h = synchronousChannel((n) => n === 1 ? { move: 0.25 } : {});
+	try {
+		const refused = h.invoke({ bound: 2 });
+		await refused.done;
+		await settle();
+		assert.equal(refused.ending.ending, "not-delivered");
+		assert.equal(refused.ending.proxyCode, "deadline-passed");
+		assert.equal(refused.settled, 1, "settled once");
+		assert.equal(h.calls.length, 0, "the proxy's caller was not called");
+		assert.equal(h.half.inFlight(), 0);
+		assert.equal(h.links.length, 1);
+		assert.equal(holding(h.links[0]), false, "after its ending the link is not held");
+		const next = h.invoke({ bound: 1000, input: { n: 2 } });
+		await until(() => h.calls.length === 1, "the next call handed on");
+		assert.equal(holding(h.links[0]), true, "held while the next invocation waits: the count was not below zero");
+		h.calls[0].answer();
+		await next.done;
+		await settle();
+		assert.deepEqual(next.ending.answer, { n: 2 });
+		assert.equal(next.settled, 1);
+		assert.equal(holding(h.links[0]), false, "let go after the last ending");
+		assert.equal(h.links.length, 1, "one connection carried both");
+	} finally {
+		h.close();
+	}
+});
+
+test("PX4, PX6: over a channel delivering synchronously, a close reported during the invoke's write: once written, the invocation ends unknown with proxy-lost, once; nothing written, it is written on the next connection and answered, once; afterwards no link is held", { timeout: 30_000 }, async () => {
+	{
+		const h = synchronousChannel((n) => n === 1 ? { closeWritten: true } : {});
+		try {
+			const lost = h.invoke({ bound: 1000, input: { n: 1 } });
+			await lost.done;
+			await settle();
+			assert.equal(lost.ending.ending, "unknown");
+			assert.equal(lost.ending.reason, "proxy-lost");
+			assert.equal(lost.settled, 1, "settled once");
+			assert.equal(h.links[0].invokesRead, 1, "written once, and not again");
+			assert.equal(holding(h.links[0]), false, "the closed link is not held");
+			// The proxy's call, its connection gone, ends later; its ending is dropped and changes nothing.
+			h.calls[0].answer();
+			await settle();
+			assert.equal(lost.settled, 1);
+			assert.equal(lost.ending.reason, "proxy-lost");
+			const next = h.invoke({ bound: 1000, input: { n: 2 } });
+			await until(() => h.calls.length === 2, "the next call handed on, over a new connection");
+			assert.equal(h.links.length, 2);
+			assert.equal(holding(h.links[1]), true);
+			h.calls[1].answer();
+			await next.done;
+			await settle();
+			assert.deepEqual(next.ending.answer, { n: 2 });
+			assert.equal(holding(h.links[1]), false, "let go after the last ending");
+			assert.equal(holding(h.links[0]), false);
+		} finally {
+			h.close();
+		}
+	}
+	{
+		const h = synchronousChannel((n) => n === 1 ? { closeUnwritten: true } : {});
+		try {
+			const answered = h.invoke({ bound: 1000, input: { n: 3 } });
+			await until(() => h.calls.length === 1, "the call handed on, over a new connection");
+			assert.equal(h.links.length, 2, "nothing written on the first connection, so the invocation went on a new one");
+			assert.equal(h.links[0].invokesRead, 0);
+			assert.equal(holding(h.links[0]), false, "the closed link is not held");
+			assert.equal(holding(h.links[1]), true, "held while it waits");
+			h.calls[0].answer();
+			await answered.done;
+			await settle();
+			assert.deepEqual(answered.ending.answer, { n: 3 });
+			assert.equal(answered.settled, 1, "settled once");
+			assert.equal(h.links[1].invokesRead, 1);
+			assert.equal(holding(h.links[1]), false, "let go after the last ending");
+		} finally {
+			h.close();
+		}
+	}
+});
+
+test("PX4: over a channel delivering synchronously, an invocation refused during its own write beside another still waiting leaves the link held for the other; the other's ending lets it go exactly once, and the next invocation holds it again", { timeout: 30_000 }, async () => {
+	const h = synchronousChannel((n) => n === 2 ? { move: 0.25 } : {});
+	try {
+		const waiting = h.invoke({ bound: 1000, input: { n: 1 } });
+		await until(() => h.calls.length === 1, "the first call handed on");
+		const before = h.links[0].holds.length;
+		const refused = h.invoke({ bound: 2 });
+		await refused.done;
+		await settle();
+		assert.equal(refused.ending.proxyCode, "deadline-passed");
+		assert.equal(refused.settled, 1);
+		assert.equal(holding(h.links[0]), true, "still held: the first invocation waits");
+		h.calls[0].answer();
+		await waiting.done;
+		await settle();
+		assert.deepEqual(waiting.ending.answer, { n: 1 });
+		assert.equal(waiting.settled, 1);
+		assert.equal(holding(h.links[0]), false, "let go after the last ending");
+		assert.deepEqual(h.links[0].holds.slice(before).filter((keep) => keep === false), [false], "let go exactly once");
+		const next = h.invoke({ bound: 1000, input: { n: 3 } });
+		await until(() => h.calls.length === 2, "the next call handed on");
+		assert.equal(holding(h.links[0]), true, "the next invocation holds it: the count was not below zero");
+		h.calls[1].answer();
+		await next.done;
+		await settle();
+		assert.equal(holding(h.links[0]), false);
+		assert.equal(h.half.inFlight(), 0);
+	} finally {
+		h.close();
+	}
 });
 
 // ---------------------------------------------------------------------------------------------------------

@@ -5,7 +5,7 @@
 // in this process with an injected clock and a temporary runtime directory - at the idle boundary with a raw
 // client as a child process, and with failures injected into its starting and stopping: a failed removal of the
 // channel socket, a failed close of the channel's server and of ownership, an observer throwing at each stage,
-// and a caller that fails to stop, each asserting the status, that every later step ran, that no server is left
+// a clock reading or timer failing at each point of starting, and a caller that fails to stop, each asserting the status, that every later step ran, that no server is left
 // listening, and that a later start in the same process owns the key - and - marked "(processes)" - one
 // real proxy process with an idle time of 1 second, and a real client that returns from its program.
 import assert from "node:assert/strict";
@@ -398,6 +398,136 @@ test("a start that fails after taking ownership - an observer throwing at owned 
 		assert.equal(r.owned, false, `${stage}: ownership released before the failure is given`);
 		assert.equal(r.socket, false, `${stage}: no channel socket left`);
 		assert.deepEqual(r.rejections, [], `${stage}: no unhandled rejection`);
+	}
+});
+
+/**
+ * A clock port over `clock` that counts its readings and its timers, and fails the `failAt`th of the kind named,
+ * `nowNs` or `schedule`, by throwing; `count()` gives how many of each were made.
+ */
+function faultingClock(clock, { kind, failAt } = {}) {
+	const made = { nowNs: 0, schedule: 0 };
+	const fault = (which) => {
+		made[which]++;
+		if (which === kind && made[which] === failAt) throw new Error(`clock ${which} ${failAt} failed`);
+	};
+	return {
+		count: () => ({ ...made }),
+		nowNs() { fault("nowNs"); return clock.nowNs(); },
+		schedule(delayMs, callback) { fault("schedule"); return clock.schedule(delayMs, callback); },
+	};
+}
+
+/** How many clock readings and timers a start that succeeds makes before it is given, on a manual clock. */
+async function startingClockUse() {
+	const dir = path.join(shortTempDir(), "rt");
+	const key = { application: "fixture", identity: `clock-use-${process.pid}-${++faults}`, target: "quick" };
+	const port = faultingClock(createManualHopClock());
+	try {
+		const proxy = await startMachineProxyIn(dir, quickApplication(key, 1000, () => undefined), { clock: port });
+		const made = port.count();
+		proxy.stop();
+		assert.equal(await proxy.stopped, 0, "the counted start stops with status 0");
+		return made;
+	} finally {
+		fs.rmSync(path.dirname(dir), { recursive: true, force: true });
+	}
+}
+
+/**
+ * Starts a machine proxy in this process whose clock port fails at one reading or timer of starting, and checks
+ * PX7's failed start: the failure is given only once the idle timer is stopped and the channel's server and
+ * ownership are closed; running the clock past the idle time then raises nothing and leaves no timer; and the
+ * same process owns the key at once.
+ */
+async function startFailingOnClock(kind, failAt) {
+	const what = `the ${kind} ${failAt} of starting failing`;
+	const dir = path.join(shortTempDir(), "rt");
+	const key = { application: "fixture", identity: `clock-fault-${process.pid}-${++faults}`, target: "quick" };
+	const clock = createManualHopClock();
+	const port = faultingClock(clock, { kind, failAt });
+	const rejections = [];
+	const unhandled = (reason) => rejections.push(reason);
+	process.on("unhandledRejection", unhandled);
+	const servers = [];
+	const listen = net.Server.prototype.listen;
+	net.Server.prototype.listen = function (...args) { servers.push(this); return listen.apply(this, args); };
+	try {
+		let startError;
+		try {
+			await startMachineProxyIn(dir, quickApplication(key, 1000, () => undefined), { clock: port });
+		} catch (error) {
+			startError = error;
+		}
+		// As the failure is given: nothing of the start is left.
+		assert.equal(startError?.message, `clock ${kind} ${failAt} failed`, `${what}: the start fails with the clock's failure`);
+		assert.equal(clock.pending(), 0, `${what}: no timer live as the failure is given`);
+		assert.equal(servers.filter((server) => server.listening).length, 0, `${what}: no server listening as the failure is given, the channel's nor ownership's`);
+		net.Server.prototype.listen = listen;
+		assert.equal(await held(ownershipName(ensureRuntime(dir), keyDigest(key))), false, `${what}: ownership released`);
+		assert.equal(fs.existsSync(path.join(dir, `${keyDigest(key)}.sock`)), false, `${what}: no channel socket left`);
+		// Past the idle time, several times over: nothing fires, nothing throws.
+		assert.doesNotThrow(() => clock.advance(5000), `${what}: running past the idle time raises nothing`);
+		assert.equal(clock.pending(), 0, `${what}: no timer live past the idle time`);
+		await settle();
+		assert.deepEqual(rejections, [], `${what}: no unhandled rejection`);
+		await ownedAgain(dir, key, what);
+	} finally {
+		net.Server.prototype.listen = listen;
+		for (const server of servers) if (server.listening) await new Promise((resolve) => server.close(resolve));
+		process.removeListener("unhandledRejection", unhandled);
+		fs.rmSync(path.dirname(dir), { recursive: true, force: true });
+	}
+}
+
+test("a start whose clock reading throws - at each reading starting makes, the call clock's origin included - stops its idle timer and closes the channel's server and ownership before its failure is given; past the idle time nothing throws and no timer or server is live, and the same process owns the key at once", { timeout: 60_000 }, async () => {
+	const made = await startingClockUse();
+	// The idle timer's moment, its first delay, and the call clock's origin, at the least.
+	assert.ok(made.nowNs >= 3, `a start reads the clock at least three times, not ${made.nowNs}`);
+	for (let failAt = 1; failAt <= made.nowNs; failAt++) await startFailingOnClock("nowNs", failAt);
+});
+
+test("a start whose clock cannot arm a timer - at each timer starting arms - closes everything it opened before its failure is given; past the idle time nothing throws, and the same process owns the key at once", { timeout: 60_000 }, async () => {
+	const made = await startingClockUse();
+	assert.ok(made.schedule >= 1, `a start arms its idle timer, not ${made.schedule} timers`);
+	for (let failAt = 1; failAt <= made.schedule; failAt++) await startFailingOnClock("schedule", failAt);
+});
+
+test("on the system's own clock, a start whose call clock's origin reading throws leaves no idle timer to fire: past the idle time nothing throws, and the same process owns the key at once", { timeout: 60_000 }, async () => {
+	const dir = path.join(shortTempDir(), "rt");
+	const key = { application: "fixture", identity: `clock-origin-${process.pid}-${++faults}`, target: "quick" };
+	const uncaught = [];
+	const monitor = (error) => uncaught.push(error);
+	process.on("uncaughtExceptionMonitor", monitor);
+	// The origin is the reading after the observer is told `listening`.
+	let originNext = false;
+	const port = {
+		nowNs() {
+			if (originNext) {
+				originNext = false;
+				throw new Error("call clock origin unavailable");
+			}
+			return machineClock.nowNs();
+		},
+		schedule: (delayMs, callback) => machineClock.schedule(delayMs, callback),
+	};
+	const servers = [];
+	const listen = net.Server.prototype.listen;
+	net.Server.prototype.listen = function (...args) { servers.push(this); return listen.apply(this, args); };
+	try {
+		await assert.rejects(startMachineProxyIn(dir, quickApplication(key, 1000, () => undefined), { clock: port, observe: (stage) => { if (stage === "listening") originNext = true; } }), /call clock origin unavailable/);
+		assert.equal(servers.filter((server) => server.listening).length, 0, "no server listening as the failure is given");
+		net.Server.prototype.listen = listen;
+		assert.equal(await held(ownershipName(ensureRuntime(dir), keyDigest(key))), false, "ownership released at once");
+		// The idle time is 1 second; three are waited, for a loaded machine.
+		await sleep(3000);
+		assert.deepEqual(uncaught.map(String), [], "nothing thrown past the idle time");
+		await ownedAgain(dir, key, "the call clock's origin failing on the system's clock");
+	} finally {
+		net.Server.prototype.listen = listen;
+		for (const server of servers) if (server.listening) await new Promise((resolve) => server.close(resolve));
+		process.removeListener("uncaughtExceptionMonitor", monitor);
+		fs.rmSync(path.dirname(dir), { recursive: true, force: true });
 	}
 });
 

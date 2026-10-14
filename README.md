@@ -2,7 +2,7 @@
 
 Let short-lived processes invoke named operations through one long-lived caller they share, each invocation still ending honestly.
 
-**Status: built at zorg's Delta 1, stage 4a, awaiting its verification.**\
+**Status: built, and certified at zorg's Delta 1, stage 4a, at `1d3d127`.**\
 Its vision is ratified (zorg's `D50`), and its contract's design is certified at zorg's Delta 1, stage 0.\
 Its contract tests run operation-call's caller suite through the client half, and the proxy's own cases over real Unix domain sockets, abstract-namespace sockets and child processes, so they run on Linux only.\
 `npm test` also compiles `test/types/caller-interface-parity.ts`, a strict consumer of operation-call's caller interface, which passes when it compiles: it accepts operation-call's caller and the client half unchanged (zorg's `EM12`).

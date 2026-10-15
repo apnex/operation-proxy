@@ -35,7 +35,7 @@ The trait column names any trait a system takes on by using the capability.
 
 | Capability | Relation | Requires | What a consumer can depend on | Trait |
 |---|---|---|---|---|
-| `proxied-invocation` | provides | `operation-call:honest-call-ending`, `operation-call:caller-chosen-bound`, `operation-call:invocation-identity`, `operation-call:request-correlation` | A short-lived process invokes a named operation through the proxy and gets exactly one ending, within the bound it chose, kept across the hop: the ending of the direct call the proxy makes for it, with a bound a hop allowance shorter (`PX5`), unchanged, when it reaches the process before the bound passes, refused `not-sendable`, or `unknown` with `bound-passed`, as the call layer's caller ends it, when the client half's own checks end it with nothing written (`PX5`), not delivered with the proxy's code when nothing of the invocation was handed on (`PX6`), and otherwise unknown - never an answer, never not delivered - with the hop's reason and no AGP code or delivery report, both where the hop loses certainty and where the call layer's ending has not been produced or carried back by the process's own bound; an invocation's identity is the same through the proxy as in a direct call, an invocation whose process has gone is finished and its ending dropped, and the proxy never repeats an invocation on its own. | none |
+| `proxied-invocation` | provides | `operation-call:honest-call-ending`, `operation-call:caller-chosen-bound`, `operation-call:invocation-identity`, `operation-call:request-correlation`, `operation-call:call-refusal`, `shape-check:plain-json-value` | A short-lived process invokes a named operation through the proxy and gets exactly one ending, within the bound it chose, kept across the hop: the ending of the direct call the proxy makes for it, with a bound a hop allowance shorter (`PX5`), unchanged, when it reaches the process before the bound passes, refused `not-sendable`, or `unknown` with `bound-passed`, as the call layer's caller ends it, when the client half's own checks end it with nothing written (`PX5`), not delivered with the proxy's code when nothing of the invocation was handed on (`PX6`), and otherwise unknown - never an answer, never not delivered - with the hop's reason and no AGP code or delivery report, both where the hop loses certainty and where the call layer's ending has not been produced or carried back by the process's own bound; an invocation's identity is the same through the proxy as in a direct call, an invocation whose process has gone is finished and its ending dropped, and the proxy never repeats an invocation on its own. | none |
 | `caller-interface-parity` | provides | `operation-call:honest-call-ending`, `operation-call:caller-chosen-bound`, `operation-call:invocation-identity` | The client half offers the caller interface the call layer offers, so code written against the call layer runs through the proxy unchanged. | none |
 | `proxy-on-demand` | provides | none | A proxy is there when the first process of an application, identity and target needs it, with nothing set up beforehand: on a machine `PX2` serves, processes that start at once end with one proxy, and a proxy left behind by a crash is replaced; in a browser, the browser keeps one per application, identity and target. | none |
 | `proxy-idle-expiry` | provides | none | A proxy on a machine ends itself after an idle time the application states, and never ends itself while an invocation it carries is in flight; in a browser, the browser ends it after the last page that uses it. | none |
@@ -98,7 +98,7 @@ Tested by: `E17`, in `test/contract/proxied-invocation.test.js`.
 
 **PX5 - Preparing, the bound, and when a proxied call is made.**\
 The client half offers the call layer's caller interface, and one more step, preparing: connecting, sending `hello` and receiving `welcome`, until a deadline the caller gives.\
-Before it writes an invocation, the client half applies the call layer's own checks on the caller's side (`EM11`) - numbers, depth, and a request message of at most 16777216 bytes - and ends one that fails them exactly as the call layer would, refused as `not-sendable`, so every invocation it writes fits a line; it refuses as the call layer does, with `EM9`'s `not-sendable` record exactly and an attempt identity it makes as `EM11` writes it.\
+Before it writes an invocation, the client half reads its clock first and then validates the call request and snapshots its `input` once through `operation-call`'s `readCallRequest` (`D55`), and applies the call layer's own checks on the caller's side (`EM11`) - numbers, depth, and a request message of at most 16777216 bytes, measured through `shape-check`'s `plain-json-value` - ending one that fails them exactly as the call layer would, refused as `not-sendable`, so every invocation it writes fits a line; it refuses as the call layer does, with `EM9`'s `not-sendable` record exactly and an attempt identity it makes as `EM11` writes it.\
 It reads its clock again once those checks are done, and when the caller's deadline has passed by then, it ends the invocation as the call layer's caller does - `unknown` with `bound-passed`, its attempt identity, and `agpCode` and `deliveryReport` `null` - with nothing written, so a deadline passed while checking wins over a refusal the checks found, for a prepared client half and an unprepared one alike.\
 A host so long that the invocation would not fit a line - never one AGP accepts as a node name - is refused `not-sendable` too, where a direct call would meet AGP's own refusal.\
 An invocation's bound starts when the caller invokes, as `EM12` says; when the client half is not prepared then, preparing happens within that bound, and a connection lost between invocations is prepared again within the next invocation's bound, so a find's pages keep the one deadline `EM10` gives them.\
@@ -149,6 +149,7 @@ Verified as a design under `E13`; its executable test, `test/contract/browser-ad
 
 **PX9 - What an application supplies.**\
 The key; on a machine, the command that launches its proxy, and the idle time, the launching command's prevailing; the function that builds the proxy's caller from the key, and the test of when that caller is ready; the hop allowance, a whole number of milliseconds from 0 to 1000, by default 50; and, in a browser, the worker script.\
+What the proxy's caller returns from `invoke`, after any declared native `Promise` completion (a non-native thenable is not awaited), and what an `end` message carries on the channel are read as plain data through `operation-call`'s `readCallEnding` and `readRefusalRecord` and `shape-check`'s `readPlainJson` and `observePromises` (zorg's `D54`, `D55`), any non-plain or thrown value from `invoke`, `buildCaller` or `callerReady` having its native promises observed.\
 Tested by: `E17`, in `test/contract/one-identity-per-proxy.test.js`, with a fixture application.
 
 **PX10 - The call layer's own checks, through the proxy.**\
@@ -166,7 +167,7 @@ Tested by: `E17`, in that file; and `E6`, in operation-call's tests, which run t
 This repository, `apnex/operation-proxy`, private until its first working code is certified.\
 The package `@apnex/operation-proxy` exports `createProxyClient` and `createProxyHalf`, the two halves over any channel and clock, `callClockOf`, `keyDigest`, `CHANNEL_LIMITS` and `DEFAULT_HOP_ALLOWANCE_MS`, and imports no module particular to one runtime; `@apnex/operation-proxy/machine` exports the machine adapter for Linux, `createMachineClient`, `startMachineProxy` and `runMachineProxy`, as `export-map.json` records.\
 The browser adapter of `PX8` is declared and not built, deferred in the export map under zorg's `D31`.\
-It depends on `@apnex/operation-call` through a `file:` link, and its tests on AGP's packages the same way.
+It depends on `@apnex/operation-call` and `@apnex/shape-check` through `file:` links, and its tests on AGP's packages the same way.
 
 ---
 
@@ -215,7 +216,8 @@ Its proxy process and client half are halves of one duty, not separate component
 
 **Consumes, through a declared contract:**
 
-- `operation-call`: `honest-call-ending`, `caller-chosen-bound`, `invocation-identity`, `request-correlation`
+- `operation-call`: `honest-call-ending`, `caller-chosen-bound`, `invocation-identity`, `request-correlation`, `call-refusal`
+- `shape-check`: `plain-json-value`
 
 **Composed-by:** nothing yet.\
 Its first consumer, once built, is zorg's command-line client.

@@ -272,15 +272,15 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	const validBuiltCaller = (candidate: unknown): candidate is ProxiedCaller => {
 		if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
 		try {
-			const validValue = (val: unknown, queue: Frame[]): boolean => {
+			interface Frame { readonly obj: object; readonly forbidThen: boolean; readonly enter: boolean }
+			const validValue = (val: unknown, forbidThen: boolean, queue: Frame[]): boolean => {
 				if (val === null || typeof val === "boolean" || typeof val === "string" || typeof val === "function") return true;
 				if (typeof val === "number") return Number.isFinite(val);
 				if (typeof val !== "object") return false;
 				if (val instanceof Promise) return false;
-				queue.push({ obj: val, forbidThen: false, enter: true });
+				queue.push({ obj: val, forbidThen, enter: true });
 				return true;
 			};
-			interface Frame { readonly obj: object; readonly forbidThen: boolean; readonly enter: boolean }
 			const readChildren = (obj: object, forbidThen: boolean, queue: Frame[]): boolean => {
 				if (obj instanceof Promise) return false;
 				if (Object.getOwnPropertySymbols(obj).length > 0) return false;
@@ -292,7 +292,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 					if (lenDesc === undefined || !Object.hasOwn(lenDesc, "value") || typeof lenDesc.value !== "number" || !Number.isInteger(lenDesc.value) || lenDesc.value < 0 || names.length !== lenDesc.value + 1) return false;
 					for (let i = 0; i < lenDesc.value; i++) {
 						const d = Object.getOwnPropertyDescriptor(obj, String(i));
-						if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value") || !validValue(d.value, queue)) return false;
+						if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value") || !validValue(d.value, false, queue)) return false;
 					}
 					return true;
 				}
@@ -300,7 +300,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 				for (const name of Object.getOwnPropertyNames(obj)) {
 					if (forbidThen && name === "then") return false;
 					const d = Object.getOwnPropertyDescriptor(obj, name);
-					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value") || !validValue(d.value, queue)) return false;
+					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value") || !validValue(d.value, obj === candidate && name === "caller", queue)) return false;
 				}
 				return true;
 			};
@@ -310,10 +310,8 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 			if (stopDesc === undefined || stopDesc.enumerable !== true || !Object.hasOwn(stopDesc, "value") || typeof stopDesc.value !== "function") return false;
 			const invokeDesc = Object.getOwnPropertyDescriptor(callerDesc.value, "invoke");
 			if (invokeDesc === undefined || invokeDesc.enumerable !== true || !Object.hasOwn(invokeDesc, "value") || typeof invokeDesc.value !== "function") return false;
-			const queue: Frame[] = [];
-			if (!readChildren(candidate, true, queue) || !readChildren(callerDesc.value, true, queue)) return false;
-			const open = new Set<object>([candidate, callerDesc.value]);
-			if (open.size !== 2) return false;
+			const queue: Frame[] = [{ obj: candidate, forbidThen: true, enter: true }];
+			const open = new Set<object>();
 			const done = new Set<object>();
 			while (queue.length > 0) {
 				const frame = queue.pop() as Frame;
@@ -324,7 +322,6 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 				}
 				if (done.has(frame.obj)) continue;
 				if (open.has(frame.obj)) return false;
-				if (frame.obj === callerDesc.value) continue;
 				open.add(frame.obj);
 				queue.push({ obj: frame.obj, forbidThen: frame.forbidThen, enter: false });
 				if (!readChildren(frame.obj, frame.forbidThen, queue)) return false;

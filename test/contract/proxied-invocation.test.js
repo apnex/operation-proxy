@@ -1352,60 +1352,81 @@ test("D2-E4, PX4, PX5, PX6, PX9, D54, D55: src/call-checks.ts is removed; CallRe
 		// 3. startMachineProxyIn: buildCaller and callerReady plain-data and non-native-thenable checks.
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "op-proxy-d2e4-"), { mode: 0o700 });
 		try {
-			const startupCases = [
-				{
-					buildCaller: () => ({ get caller() { getters++; return { invoke: () => Promise.resolve() }; }, stop: () => undefined, p: Promise.reject(new Error("buildCaller getter promise")) }),
-					callerReady: () => undefined,
-				},
-				{
-					buildCaller: () => ({ then(resolve) { getters++; resolve({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }); }, p: Promise.reject(new Error("buildCaller thenable promise")) }),
-					callerReady: () => undefined,
-				},
-				{
-					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, get extra() { getters++; return 1; } }),
-					callerReady: () => undefined,
-				},
-				{
-					buildCaller: () => Object.defineProperty({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }, "hidden", { value: 1, enumerable: false }),
-					callerReady: () => undefined,
-				},
-				{
-					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, [Symbol("extra")]: 1 }),
-					callerReady: () => undefined,
-				},
-				{
-					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: { p: Promise.reject(new Error("buildCaller extra nested promise")) } }),
-					callerReady: () => undefined,
-				},
-				{
-					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: new (class Extra { p = Promise.reject(new Error("nested-build-class-extra")); })() }),
-					callerReady: () => undefined,
-				},
-				{
-					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: new (class Extra { x = 1; })() }),
-					callerReady: () => undefined,
-				},
-				{
-					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: [new (class Extra { x = 1; })(), ...Array.from({ length: 1000 }, () => ({}))] }),
-					callerReady: () => undefined,
-				},
-				{
-					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }),
-					callerReady: () => ({ then(resolve) { getters++; resolve(undefined); }, p: Promise.reject(new Error("callerReady thenable promise")) }),
-				},
-				{
-					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }),
-					callerReady: () => Promise.resolve({ extra: Promise.reject(new Error("callerReady non-undefined promise")) }),
-				},
-				{
-					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }),
-					callerReady: () => Promise.reject(Object.assign(new Error("callerReady rejected"), { p: Promise.reject(new Error("callerReady rejected nested")) })),
-				},
+			// Positive controls: synchronous undefined and native Promise resolving to undefined both reach ready and stop with 0.
+			for (const [i, readyFn] of [() => undefined, () => Promise.resolve(undefined)].entries()) {
+				const stages = [];
+				let readyCalls = 0;
+				let stopCalls = 0;
+				let onReady;
+				const readyPromise = new Promise((r) => { onReady = r; });
+				const proxy = await startMachineProxyIn(
+					dir,
+					{
+						key: KEY,
+						idleMs: 60_000,
+						buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => { stopCalls++; } }),
+						callerReady: () => { readyCalls++; return readyFn(); },
+					},
+					{ observe: (stage) => { stages.push(stage); if (stage === "ready") onReady(); } },
+				);
+				assert.equal(proxy.owner, true, `positive ${i} owned`);
+				await readyPromise;
+				proxy.stop();
+				assert.equal(await proxy.stopped, 0, `positive ${i} stopped cleanly with status 0`);
+				assert.ok(stages.includes("built") && stages.includes("ready"), `positive ${i} stages: ${stages.join(",")}`);
+				assert.deepEqual([readyCalls, stopCalls], [1, 1], `positive ${i} callbacks ran`);
+			}
+
+			// Malformed buildCaller cases: never reach "built" or call callerReady, and stop with status 1.
+			const buildCases = [
+				() => ({ get caller() { getters++; return { invoke: () => Promise.resolve() }; }, stop: () => undefined, p: Promise.reject(new Error("buildCaller getter promise")) }),
+				() => ({ then(resolve) { getters++; resolve({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }); }, p: Promise.reject(new Error("buildCaller thenable promise")) }),
+				() => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, get extra() { getters++; return 1; } }),
+				() => Object.defineProperty({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }, "hidden", { value: 1, enumerable: false }),
+				() => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, [Symbol("extra")]: 1 }),
+				() => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: { p: Promise.reject(new Error("buildCaller extra nested promise")) } }),
+				() => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: new (class Extra { p = Promise.reject(new Error("nested-build-class-extra")); })() }),
+				() => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: new (class Extra { x = 1; })() }),
+				() => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: [new (class Extra { x = 1; })(), ...Array.from({ length: 1000 }, () => ({}))] }),
 			];
-			for (const [i, app] of startupCases.entries()) {
-				const proxy = await startMachineProxyIn(dir, { key: KEY, idleMs: 60_000, ...app });
-				assert.equal(proxy.owner, true, `startup case ${i} owned`);
-				assert.equal(await proxy.stopped, 1, `startup case ${i} failed startup with status 1`);
+			for (const [i, buildCaller] of buildCases.entries()) {
+				const stages = [];
+				let readyCalls = 0;
+				const proxy = await startMachineProxyIn(
+					dir,
+					{ key: KEY, idleMs: 60_000, buildCaller, callerReady: () => { readyCalls++; } },
+					{ observe: (stage) => stages.push(stage) },
+				);
+				assert.equal(proxy.owner, true, `build case ${i} owned`);
+				assert.equal(await proxy.stopped, 1, `build case ${i} failed startup with status 1`);
+				assert.equal(stages.includes("built"), false, `build case ${i} did not reach built`);
+				assert.equal(readyCalls, 0, `build case ${i} did not call callerReady`);
+			}
+
+			// Malformed callerReady cases: reach "built", execute callerReady, never reach "ready", and stop with status 1.
+			const readyCases = [
+				() => ({ then(resolve) { getters++; resolve(undefined); }, p: Promise.reject(new Error("callerReady thenable promise")) }),
+				() => Promise.resolve({ extra: Promise.reject(new Error("callerReady non-undefined promise")) }),
+				() => Promise.reject(Object.assign(new Error("callerReady rejected"), { p: Promise.reject(new Error("callerReady rejected nested")) })),
+			];
+			for (const [i, readyFn] of readyCases.entries()) {
+				const stages = [];
+				let readyCalls = 0;
+				const proxy = await startMachineProxyIn(
+					dir,
+					{
+						key: KEY,
+						idleMs: 60_000,
+						buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }),
+						callerReady: () => { readyCalls++; return readyFn(); },
+					},
+					{ observe: (stage) => stages.push(stage) },
+				);
+				assert.equal(proxy.owner, true, `ready case ${i} owned`);
+				assert.equal(await proxy.stopped, 1, `ready case ${i} failed startup with status 1`);
+				assert.equal(stages.includes("built"), true, `ready case ${i} reached built`);
+				assert.equal(stages.includes("ready"), false, `ready case ${i} did not reach ready`);
+				assert.equal(readyCalls, 1, `ready case ${i} called callerReady`);
 			}
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });

@@ -269,8 +269,18 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	 * promises, `caller.invoke` and `stop` are functions, and any plain object or array reachable from the
 	 * record's own properties holds only own enumerable data descriptors with no symbols, getters or promises.
 	 */
-	const validBuiltCaller = (candidate: unknown): candidate is ProxiedCaller => {
-		if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+	const validateBuiltCaller = (candidate: unknown): ProxiedCaller | undefined => {
+		const captured: unknown[] = [candidate];
+		const fail = (): undefined => {
+			for (const item of captured) observePromises(item);
+			return undefined;
+		};
+		if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return fail();
+		const readDesc = (obj: object, name: string): PropertyDescriptor | undefined => {
+			const d = Object.getOwnPropertyDescriptor(obj, name);
+			if (d !== undefined && Object.hasOwn(d, "value")) captured.push(d.value);
+			return d;
+		};
 		try {
 			interface Frame { readonly obj: object; readonly forbidThen: boolean; readonly enter: boolean }
 			const validValue = (val: unknown, forbidThen: boolean, queue: Frame[]): boolean => {
@@ -281,6 +291,9 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 				queue.push({ obj: val, forbidThen, enter: true });
 				return true;
 			};
+			let callerObj: object | undefined;
+			let stopFn: (() => Promise<void> | void) | undefined;
+			let invokeFn: CallLayerCaller["invoke"] | undefined;
 			const readChildren = (obj: object, forbidThen: boolean, queue: Frame[]): boolean => {
 				if (obj instanceof Promise) return false;
 				if (Object.getOwnPropertySymbols(obj).length > 0) return false;
@@ -288,10 +301,10 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 				if (Array.isArray(obj)) {
 					if (proto !== Array.prototype) return false;
 					const names = Object.getOwnPropertyNames(obj);
-					const lenDesc = Object.getOwnPropertyDescriptor(obj, "length");
+					const lenDesc = readDesc(obj, "length");
 					if (lenDesc === undefined || !Object.hasOwn(lenDesc, "value") || typeof lenDesc.value !== "number" || !Number.isInteger(lenDesc.value) || lenDesc.value < 0 || names.length !== lenDesc.value + 1) return false;
 					for (let i = 0; i < lenDesc.value; i++) {
-						const d = Object.getOwnPropertyDescriptor(obj, String(i));
+						const d = readDesc(obj, String(i));
 						if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value") || !validValue(d.value, false, queue)) return false;
 					}
 					return true;
@@ -299,17 +312,22 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 				if (proto !== Object.prototype && proto !== null) return false;
 				for (const name of Object.getOwnPropertyNames(obj)) {
 					if (forbidThen && name === "then") return false;
-					const d = Object.getOwnPropertyDescriptor(obj, name);
-					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value") || !validValue(d.value, obj === candidate && name === "caller", queue)) return false;
+					const d = readDesc(obj, name);
+					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value")) return false;
+					if (obj === candidate && name === "caller") {
+						if (typeof d.value !== "object" || d.value === null || Array.isArray(d.value)) return false;
+						callerObj = d.value;
+					} else if (obj === candidate && name === "stop") {
+						if (typeof d.value !== "function") return false;
+						stopFn = d.value as () => Promise<void> | void;
+					} else if (obj === callerObj && name === "invoke") {
+						if (typeof d.value !== "function") return false;
+						invokeFn = d.value as CallLayerCaller["invoke"];
+					}
+					if (!validValue(d.value, obj === candidate && name === "caller", queue)) return false;
 				}
 				return true;
 			};
-			const callerDesc = Object.getOwnPropertyDescriptor(candidate, "caller");
-			const stopDesc = Object.getOwnPropertyDescriptor(candidate, "stop");
-			if (callerDesc === undefined || callerDesc.enumerable !== true || !Object.hasOwn(callerDesc, "value") || typeof callerDesc.value !== "object" || callerDesc.value === null || Array.isArray(callerDesc.value)) return false;
-			if (stopDesc === undefined || stopDesc.enumerable !== true || !Object.hasOwn(stopDesc, "value") || typeof stopDesc.value !== "function") return false;
-			const invokeDesc = Object.getOwnPropertyDescriptor(callerDesc.value, "invoke");
-			if (invokeDesc === undefined || invokeDesc.enumerable !== true || !Object.hasOwn(invokeDesc, "value") || typeof invokeDesc.value !== "function") return false;
 			const queue: Frame[] = [{ obj: candidate, forbidThen: true, enter: true }];
 			const open = new Set<object>();
 			const done = new Set<object>();
@@ -321,25 +339,26 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 					continue;
 				}
 				if (done.has(frame.obj)) continue;
-				if (open.has(frame.obj)) return false;
+				if (open.has(frame.obj)) return fail();
 				open.add(frame.obj);
 				queue.push({ obj: frame.obj, forbidThen: frame.forbidThen, enter: false });
-				if (!readChildren(frame.obj, frame.forbidThen, queue)) return false;
+				if (!readChildren(frame.obj, frame.forbidThen, queue)) return fail();
 			}
-			return true;
+			if (callerObj === undefined || stopFn === undefined || invokeFn === undefined) return fail();
+			return candidate as ProxiedCaller;
 		} catch (error) {
-			observePromises(error);
-			return false;
+			captured.push(error);
+			return fail();
 		}
 	};
 	let built: ProxiedCaller | undefined;
 	const building = (async () => {
 		const { value: candidate } = await awaitNative(() => application.buildCaller(key, { clock: callClock }));
-		if (!validBuiltCaller(candidate)) {
-			observePromises(candidate);
+		const validated = validateBuiltCaller(candidate);
+		if (validated === undefined) {
 			throw new TypeError("buildCaller must return a plain object with caller.invoke and stop functions");
 		}
-		built = candidate;
+		built = validated;
 		observe("built");
 		return built;
 	})();

@@ -1388,6 +1388,15 @@ test("D2-E4, PX4, PX5, PX6, PX9, D54, D55: src/call-checks.ts is removed; CallRe
 				() => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: new (class Extra { p = Promise.reject(new Error("nested-build-class-extra")); })() }),
 				() => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: new (class Extra { x = 1; })() }),
 				() => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: [new (class Extra { x = 1; })(), ...Array.from({ length: 1000 }, () => ({}))] }),
+				() => {
+					let reads = 0;
+					return new Proxy({ caller: { invoke: async () => {} }, stop() {}, extra: 0 }, {
+						getOwnPropertyDescriptor(target, prop) {
+							if (prop === "extra" && ++reads === 1) return { configurable: true, enumerable: true, writable: true, value: Promise.reject(new Error("first-read descriptor promise")) };
+							return Reflect.getOwnPropertyDescriptor(target, prop);
+						},
+					});
+				},
 			];
 			for (const [i, buildCaller] of buildCases.entries()) {
 				const stages = [];

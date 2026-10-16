@@ -42,6 +42,7 @@
     "typescript": "5.9.3"
   },
   "dependencies": {
-    "@apnex/operation-call": "file:../operation-call"
+    "@apnex/operation-call": "file:../operation-call",
+    "@apnex/shape-check": "file:../shape-check"
   }
 }

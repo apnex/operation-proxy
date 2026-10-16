@@ -19,6 +19,7 @@
  * the connection. Nothing here is particular to one runtime.
  */
 import type { JsonValue } from "@apnex/operation-call";
+import { readPlainJson } from "@apnex/shape-check";
 import { isInvocationId, MESSAGE_LIMITS, NAME_PATTERN } from "@apnex/operation-call/message-format";
 import { hasExactly, isObject, readCarriedEnding, type CarriedEnding } from "./endings.js";
 import type { ProxyKey } from "./key.js";
@@ -117,19 +118,27 @@ export function isMachineDeadline(value: unknown): value is string {
 	return typeof value === "string" && /^(0|[1-9][0-9]{0,29})$/.test(value);
 }
 
-/** True when a value holds `operationProxy` 1 and the type given, as an object. */
-function headed(value: unknown, type: string): value is { readonly [name: string]: unknown } {
-	return isObject(value) && value.operationProxy === CHANNEL_VERSION && value.type === type;
+/** Reads an incoming channel value as plain JSON data (zorg's D54, D55), or undefined. */
+function plainObject(raw: unknown): { readonly [name: string]: unknown } | undefined {
+	const plain = readPlainJson(raw);
+	return plain.ok && isObject(plain.value) ? plain.value : undefined;
 }
 
-/** True when a value is an object whose `operationProxy` is not 1: a version the proxy refuses (PX4). */
-export function isOtherVersion(value: unknown): boolean {
-	return isObject(value) && value.operationProxy !== CHANNEL_VERSION;
+/** True when a plain object holds `operationProxy` 1 and the type given. */
+function headed(value: { readonly [name: string]: unknown } | undefined, type: string): boolean {
+	return value !== undefined && value.operationProxy === CHANNEL_VERSION && value.type === type;
+}
+
+/** True when a value is a plain object whose `operationProxy` is not 1: a version the proxy refuses (PX4). */
+export function isOtherVersion(raw: unknown): boolean {
+	const value = plainObject(raw);
+	return value !== undefined && value.operationProxy !== CHANNEL_VERSION;
 }
 
 /** Reads a `hello`; its key's three fields must be strings, compared with the proxy's own as they are. */
-export function readHello(value: unknown): HelloMessage | undefined {
-	if (!headed(value, "hello") || !hasExactly(value, ["operationProxy", "type", "key"])) return undefined;
+export function readHello(raw: unknown): HelloMessage | undefined {
+	const value = plainObject(raw);
+	if (value === undefined || !headed(value, "hello") || !hasExactly(value, ["operationProxy", "type", "key"])) return undefined;
 	const key = value.key;
 	if (!isObject(key) || !hasExactly(key, ["application", "identity", "target"])) return undefined;
 	if (typeof key.application !== "string" || typeof key.identity !== "string" || typeof key.target !== "string") return undefined;
@@ -137,7 +146,9 @@ export function readHello(value: unknown): HelloMessage | undefined {
 }
 
 /** Reads an `invoke` or an `abort`, the messages a client sends once welcomed. */
-export function readInvokeOrAbort(value: unknown): InvokeMessage | AbortMessage | undefined {
+export function readInvokeOrAbort(raw: unknown): InvokeMessage | AbortMessage | undefined {
+	const value = plainObject(raw);
+	if (value === undefined) return undefined;
 	if (headed(value, "abort")) return hasExactly(value, ["operationProxy", "type", "request"]) && isRequestNumber(value.request) ? value as unknown as AbortMessage : undefined;
 	if (!headed(value, "invoke")) return undefined;
 	const names = ["operationProxy", "type", "request", "invocation", "host", "service", "operation", "input", "deadline", "repeat", "aborted"];
@@ -149,7 +160,9 @@ export function readInvokeOrAbort(value: unknown): InvokeMessage | AbortMessage 
 }
 
 /** Reads a `welcome` or a `refused`, the messages a proxy may send before it welcomes. */
-export function readWelcomeOrRefused(value: unknown): WelcomeMessage | RefusedMessage | undefined {
+export function readWelcomeOrRefused(raw: unknown): WelcomeMessage | RefusedMessage | undefined {
+	const value = plainObject(raw);
+	if (value === undefined) return undefined;
 	if (headed(value, "welcome")) return hasExactly(value, ["operationProxy", "type"]) ? value as unknown as WelcomeMessage : undefined;
 	if (headed(value, "refused") && hasExactly(value, ["operationProxy", "type", "code"]) && (value.code === "key-mismatch" || value.code === "version")) {
 		return value as unknown as RefusedMessage;
@@ -161,9 +174,11 @@ export function readWelcomeOrRefused(value: unknown): WelcomeMessage | RefusedMe
  * Reads an `end` for one of the requests a client wrote, given what it asked for each; a request it never
  * wrote, or an ending not of that invocation and operation, is undefined.
  */
-export function readEnd(value: unknown, asked: (request: number) => { readonly invocation: string; readonly operation: string } | undefined): EndMessage | undefined {
-	if (!headed(value, "end") || !hasExactly(value, ["operationProxy", "type", "request", "ending"]) || !isRequestNumber(value.request)) return undefined;
+export function readEnd(raw: unknown, asked: (request: number) => { readonly invocation: string; readonly operation: string } | undefined): EndMessage | undefined {
+	const value = plainObject(raw);
+	if (value === undefined || !headed(value, "end") || !hasExactly(value, ["operationProxy", "type", "request", "ending"]) || !isRequestNumber(value.request)) return undefined;
 	const what = asked(value.request);
 	if (what === undefined) return undefined;
-	return readCarriedEnding(value.ending, what.invocation, what.operation) === undefined ? undefined : value as unknown as EndMessage;
+	const ending = readCarriedEnding(value.ending, what.invocation, what.operation);
+	return ending === undefined ? undefined : Object.freeze({ operationProxy: 1, type: "end", request: value.request, ending });
 }

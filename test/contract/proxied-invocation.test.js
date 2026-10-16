@@ -1247,3 +1247,145 @@ test("PX6 (processes): a client killed during a call leaves the fixture host one
 	assert.equal(next.ending.answer.pid, proxy, "the proxy runs on, having finished the call and dropped its ending");
 	assert.equal(f.runs().filter((r) => r.operation === "hold").length, 1);
 });
+
+test("D2-E4, PX4, PX5, PX6, PX9, D54, D55: src/call-checks.ts is removed; CallRequest delegates to readCallRequest; CallLayerCaller.invoke, buildCaller and callerReady read results as plain data with zero getter calls and zero unhandled rejections", async () => {
+	const { fileURLToPath } = await import("node:url");
+	const os = await import("node:os");
+	const { startMachineProxyIn } = await import("../../dist/machine-adapter.js");
+	const here = path.dirname(fileURLToPath(import.meta.url));
+	assert.equal(fs.existsSync(path.join(here, "..", "..", "src", "call-checks.ts")), false, "src/call-checks.ts does not exist");
+
+	// 1. Client half reads clock first, then each field of CallRequest at most once via readCallRequest.
+	const order = [];
+	const clock = createManualHopClock();
+	const trackedClock = {
+		nowNs: () => { order.push("clock"); return clock.nowNs(); },
+		schedule: (ms, fn) => clock.schedule(ms, fn),
+	};
+	const client = createProxyClient({
+		key: KEY,
+		clock: trackedClock,
+		identities: machineIdentities,
+		connector: {
+			connect: async () => ({ kind: "refused", code: "key-mismatch" }),
+			launch: () => undefined,
+		},
+	});
+	const ending = await client.invoke({
+		get host() { order.push("host"); return "host-a"; },
+		get service() { order.push("service"); return "svc"; },
+		get operation() { order.push("operation"); return "echo"; },
+		get input() { order.push("input"); return { get x() { order.push("input.x"); return 1; } }; },
+		get bound() { order.push("bound"); return 100; },
+	});
+	assert.equal(ending.ending, "not-delivered");
+	assert.equal(order[0], "clock", "clock read first");
+	assert.deepEqual(order.slice(1, 7), ["host", "service", "operation", "input", "input.x", "bound"], "each CallRequest field and input getter read once");
+
+	// 2. Proxy half: non-plain / non-native-thenable / throwing CallLayerCaller.invoke results send nothing (hop-stalled),
+	// keep the connection open, call zero getters, and leak zero unhandled rejections.
+	let getters = 0;
+	const unhandled = [];
+	const onUnhandled = (r) => unhandled.push(r);
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		const sym = Symbol("s");
+		const badResults = [
+			(call) => ({ get ending() { getters++; return "answered"; }, invocation: call.invocation, attempt: `${call.invocation}.00000001`, operation: call.operation, answer: 1, p: Promise.reject(new Error("getter promise")) }),
+			(call) => Promise.resolve({ ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000001`, operation: call.operation, answer: { get x() { getters++; return 1; }, p: Promise.reject(new Error("answer getter promise")) } }),
+			(call) => ({ then(resolve) { getters++; resolve({ ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000001`, operation: call.operation, answer: 1 }); }, p: Promise.reject(new Error("thenable promise")) }),
+			(call) => Promise.resolve(Object.create({ ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000001`, operation: call.operation, answer: 1 })),
+			(call) => Promise.resolve({ ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000001`, operation: call.operation, answer: 1, [sym]: 1 }),
+			(call) => Promise.resolve({ ending: "not-delivered", invocation: call.invocation, attempt: null, operation: call.operation, agpCode: null, proxyCode: "deadline-passed", earlierAttemptsUncertain: false }),
+			() => Promise.reject(Object.assign(new Error("invoke rejected"), { p: Promise.reject(new Error("invoke rejected nested")) })),
+			() => { throw Object.assign(new Error("invoke threw"), { p: Promise.reject(new Error("invoke thrown nested")) }); },
+		];
+		let callIdx = 0;
+		const hopClock = createManualHopClock();
+		const half = createProxyHalf({ key: KEY, clock: hopClock, idleMs: 60_000, onIdle: () => undefined });
+		half.ready({
+			invoke(call) {
+				if (call.operation === "good") {
+					return Promise.resolve({ ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000001`, operation: call.operation, answer: call.input });
+				}
+				return badResults[callIdx++ % badResults.length](call);
+			},
+		}, callClockOf(hopClock));
+		let toClient;
+		let toProxy;
+		const pairClient = createProxyClient({
+			key: KEY,
+			clock: hopClock,
+			identities: machineIdentities,
+			connector: {
+				connect: async (clientHandlers) => {
+					toClient = clientHandlers;
+					toProxy = half.accept({
+						write: (msg) => { toClient.message(msg); return true; },
+						hold: () => undefined,
+						close: () => toClient.closed(),
+					});
+					return {
+						kind: "connected",
+						link: {
+							write: (msg) => { toProxy.message(msg); return true; },
+							hold: () => undefined,
+							close: () => toProxy.closed(),
+						},
+					};
+				},
+				launch: () => undefined,
+			},
+		});
+		for (let i = 0; i < badResults.length; i++) {
+			const pending = watch(pairClient.invoke({ host: "host-a", service: "svc", operation: "bad", input: i, bound: 200 }));
+			await settle(5);
+			hopClock.advance(200);
+			await until(pending.settled, `bad case ${i}`);
+			assert.deepEqual([pending.value().ending, pending.value().reason], ["unknown", "hop-stalled"], `bad case ${i} ends hop-stalled`);
+		}
+		const good = await pairClient.invoke({ host: "host-a", service: "svc", operation: "good", input: "ok", bound: 200 });
+		assert.deepEqual([good.ending, good.answer], ["answered", "ok"], "the connection stays open and carries the next call");
+		pairClient.close();
+		half.stopIdle();
+
+		// 3. startMachineProxyIn: buildCaller and callerReady plain-data and non-native-thenable checks.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "op-proxy-d2e4-"), { mode: 0o700 });
+		try {
+			const startupCases = [
+				{
+					buildCaller: () => ({ get caller() { getters++; return { invoke: () => Promise.resolve() }; }, stop: () => undefined, p: Promise.reject(new Error("buildCaller getter promise")) }),
+					callerReady: () => undefined,
+				},
+				{
+					buildCaller: () => ({ then(resolve) { getters++; resolve({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }); }, p: Promise.reject(new Error("buildCaller thenable promise")) }),
+					callerReady: () => undefined,
+				},
+				{
+					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }),
+					callerReady: () => ({ then(resolve) { getters++; resolve(undefined); }, p: Promise.reject(new Error("callerReady thenable promise")) }),
+				},
+				{
+					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }),
+					callerReady: () => Promise.resolve({ extra: Promise.reject(new Error("callerReady non-undefined promise")) }),
+				},
+				{
+					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }),
+					callerReady: () => Promise.reject(Object.assign(new Error("callerReady rejected"), { p: Promise.reject(new Error("callerReady rejected nested")) })),
+				},
+			];
+			for (const [i, app] of startupCases.entries()) {
+				const proxy = await startMachineProxyIn(dir, { key: KEY, idleMs: 60_000, ...app });
+				assert.equal(proxy.owner, true, `startup case ${i} owned`);
+				assert.equal(await proxy.stopped, 1, `startup case ${i} failed startup with status 1`);
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+		await new Promise((r) => setTimeout(r, 30));
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+	}
+	assert.equal(getters, 0, "zero getters or non-native thenables invoked");
+	assert.deepEqual(unhandled, [], "zero unhandled rejections");
+});

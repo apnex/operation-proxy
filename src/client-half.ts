@@ -25,12 +25,12 @@
  * cleanup, each of which runs on its own, so a timer that cannot be cancelled changes nothing.
  * Nothing here is particular to one runtime (zorg's principle 6).
  */
-import type { CallRequest, IdentitySource, JsonValue, OperationCaller, RefusalRecord } from "@apnex/operation-call";
+import { readCallRequest, type CallRequest, type IdentitySource, type JsonValue, type OperationCaller, type RefusalRecord } from "@apnex/operation-call";
 import { requestSendable, writeRequest } from "@apnex/operation-call/message-format";
-import { checkCall, utf8Bytes } from "./call-checks.js";
+import { toCanonicalJson, utf8ByteLength } from "@apnex/shape-check";
 import { CHANNEL_LIMITS, writeInvoke } from "./channel-messages.js";
 import { Preparer, type ClientConnector, type Connection, type Prepared, type Waiter, type WrittenInvocation } from "./client-preparing.js";
-import { freezeEnding, hopUnknown, preparingNotDelivered, proxyNotDelivered, type CarriedEnding, type PreparingEnding, type ProxiedEnding } from "./endings.js";
+import { hopUnknown, preparingNotDelivered, proxyNotDelivered, type CarriedEnding, type PreparingEnding, type ProxiedEnding } from "./endings.js";
 import { atMoment, msToNs, type HopClock, type HopTimer } from "./hop-clock.js";
 import { checkKey, type ProxyKey } from "./key.js";
 
@@ -140,18 +140,18 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 		}
 	};
 	const invokeChecked = (call: CallRequest): Promise<ProxiedEnding> => {
-		// The bound starts when the caller invokes (EM12): the clock is read before anything else is done.
+		// The bound starts when the caller invokes (EM12, D55): the clock is read first, then each field of
+		// CallRequest at most once through operation-call's readCallRequest.
 		const start = clock.nowNs();
-		const input = checkCall(call);
-		const invocation = call.invocation ?? newInvocation();
-		const operation = call.operation;
-		const repeat = call.repeat === true;
-		const deadline = start + msToNs(call.bound);
-		const sooner = deadline - msToNs(allowanceFor(allowanceMs, call.bound));
+		const checked = readCallRequest(call);
+		const { host, service, operation, input, bound, repeat, signal } = checked;
+		const invocation = checked.invocation ?? newInvocation();
+		const deadline = start + msToNs(bound);
+		const sooner = deadline - msToNs(allowanceFor(allowanceMs, bound));
 		// The call layer's own checks on the caller's side (EM11), on the request it will send for this call, and
 		// the line the invocation is written on (PX4).
 		const attempt = `${invocation}.${randomHex(8)}`;
-		const fields = { invocation, host: call.host, service: call.service, operation, input, deadline: sooner.toString(), repeat };
+		const fields = { invocation, host, service, operation, input, deadline: sooner.toString(), repeat };
 		const sendable = requestSendable(writeRequest({ invocation, attempt, operation }, input)) && fitsLine(fields);
 		// Checked: the clock is read again, so a deadline that passed while checking - at it exactly included - wins
 		// over a refusal the checks found, as in the call layer's caller, and nothing is written (PX5).
@@ -159,7 +159,6 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 			return Promise.resolve(Object.freeze({ ending: "unknown", invocation, attempt, operation, reason: "bound-passed", agpCode: null, deliveryReport: null }));
 		}
 		if (!sendable) return Promise.resolve(Object.freeze({ ending: "refused", invocation, attempt, operation, refusal: notSendable() }));
-		const signal = call.signal;
 
 		return new Promise<ProxiedEnding>((resolve) => {
 			let decided = false;
@@ -175,7 +174,7 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 				if (decided) return;
 				decided = true;
 				if (connection !== undefined && request !== undefined) guarded(() => connection?.decided(request as number));
-				resolve(freezeEnding(ending));
+				resolve(ending);
 				guarded(() => timer?.cancel());
 				guarded(() => signal?.removeEventListener("abort", relay));
 				guarded(() => preparer.withdraw(waiter));
@@ -306,5 +305,5 @@ function guarded(step: () => void): void {
 function fitsLine(fields: { readonly invocation: string; readonly host: string; readonly service: string; readonly operation: string; readonly input: JsonValue; readonly deadline: string; readonly repeat: boolean }): boolean {
 	// The longest request number and the same deadline, so the line written can only be as long or shorter.
 	const probe = writeInvoke({ ...fields, request: Number.MAX_SAFE_INTEGER, aborted: false });
-	return utf8Bytes(JSON.stringify(probe)) + 1 <= CHANNEL_LIMITS.lineBytes;
+	return utf8ByteLength(toCanonicalJson(probe as unknown as JsonValue)) + 1 <= CHANNEL_LIMITS.lineBytes;
 }

@@ -20,6 +20,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import type { CallClock, IdentitySource } from "@apnex/operation-call";
+import { observePromises } from "@apnex/shape-check";
 import type { LinkHandlers } from "./channel-link.js";
 import { createProxyClient, checkHopAllowance, DEFAULT_HOP_ALLOWANCE_MS, type ProxyClient } from "./client-half.js";
 import { callClockOf, type HopClock, type PinnableCallClock } from "./hop-clock.js";
@@ -227,18 +228,84 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	}
 	const channel: net.Server = server;
 	const proxyHalf: ProxyHalf = half;
+	/**
+	 * Awaits `fn()` only when it returns a native `Promise` (D54, D55), wrapping the settled value in `{ value }`
+	 * so an outer `async` function never assimilates a non-native thenable.
+	 */
+	const awaitNative = async (fn: () => unknown): Promise<{ readonly value: unknown }> => {
+		let raw: unknown;
+		try {
+			raw = fn();
+		} catch (error) {
+			observePromises(error);
+			throw error;
+		}
+		let native = false;
+		try {
+			native = raw instanceof Promise;
+		} catch (error) {
+			observePromises(error);
+			observePromises(raw);
+			throw error;
+		}
+		if (!native) return { value: raw };
+		try {
+			return await (Reflect.apply(Promise.prototype.then, raw, [
+				(resolved: unknown) => ({ value: resolved }),
+				(error: unknown) => {
+					observePromises(error);
+					throw error;
+				},
+			]) as Promise<{ readonly value: unknown }>);
+		} catch (error) {
+			observePromises(error);
+			observePromises(raw);
+			throw error;
+		}
+	};
+	/** Validates a settled `buildCaller` result without invoking getters or `then`. */
+	const validBuiltCaller = (candidate: unknown): candidate is ProxiedCaller => {
+		if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+		try {
+			const proto = Object.getPrototypeOf(candidate);
+			if (proto !== Object.prototype && proto !== null) return false;
+			if (Object.getOwnPropertyDescriptor(candidate, "then") !== undefined) return false;
+			const callerDesc = Object.getOwnPropertyDescriptor(candidate, "caller");
+			const stopDesc = Object.getOwnPropertyDescriptor(candidate, "stop");
+			if (callerDesc === undefined || !Object.hasOwn(callerDesc, "value") || typeof callerDesc.value !== "object" || callerDesc.value === null) return false;
+			if (stopDesc === undefined || !Object.hasOwn(stopDesc, "value") || typeof stopDesc.value !== "function") return false;
+			const invokeDesc = Object.getOwnPropertyDescriptor(callerDesc.value, "invoke");
+			return invokeDesc !== undefined && Object.hasOwn(invokeDesc, "value") && typeof invokeDesc.value === "function";
+		} catch (error) {
+			observePromises(error);
+			return false;
+		}
+	};
 	let built: ProxiedCaller | undefined;
 	const building = (async () => {
-		built = await application.buildCaller(key, { clock: callClock });
+		const { value: candidate } = await awaitNative(() => application.buildCaller(key, { clock: callClock }));
+		if (!validBuiltCaller(candidate)) {
+			observePromises(candidate);
+			throw new TypeError("buildCaller must return a plain object with caller.invoke and stop functions");
+		}
+		built = candidate;
 		observe("built");
 		return built;
 	})();
 	building.then(async (caller) => {
-		await application.callerReady(caller);
+		const { value: readyValue } = await awaitNative(() => application.callerReady(caller));
+		// PX9, Amendment 2 item 1: callerReady completes when it settles to undefined; anything else fails startup.
+		if (readyValue !== undefined) {
+			observePromises(readyValue);
+			throw new TypeError("callerReady must settle to undefined");
+		}
 		if (stopping) return;
 		proxyHalf.ready(caller.caller, callClock);
 		observe("ready");
-	}).catch(() => void stopNow(1));
+	}).catch((error) => {
+		observePromises(error);
+		void stopNow(1);
+	});
 
 	/**
 	 * Undoes a start that failed after taking ownership: no connection is accepted any more, the proxy half's
@@ -252,8 +319,9 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		const step = async (action: () => unknown): Promise<void> => {
 			try {
 				await action();
-			} catch {
+			} catch (err) {
 				// The start's own failure is what is given; this step's leaves the later steps to run.
+				observePromises(err);
 			}
 		};
 		await step(() => made?.stopIdle());
@@ -291,7 +359,8 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		const step = async (action: () => unknown, fails = true): Promise<void> => {
 			try {
 				await action();
-			} catch {
+			} catch (err) {
+				observePromises(err);
 				if (fails) failed = true;
 			}
 		};

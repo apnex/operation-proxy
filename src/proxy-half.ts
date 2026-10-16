@@ -18,11 +18,11 @@
  * of its clock later, so a connection waiting to be accepted is counted - and stays if a connection is open or
  * a call is in flight (PX7). Nothing here is particular to one runtime.
  */
-import type { CallLayerEnding, CallRequest } from "@apnex/operation-call";
-import { MAX_BOUND_MS } from "./call-checks.js";
+import { MAX_BOUND_MS, type CallLayerEnding, type CallRequest } from "@apnex/operation-call";
+import { observePromises } from "@apnex/shape-check";
 import type { ChannelLink, LinkHandlers } from "./channel-link.js";
 import { isOtherVersion, readHello, readInvokeOrAbort, writeEnd, writeRefused, writeWelcome, type InvokeMessage } from "./channel-messages.js";
-import { proxyNotDelivered, type CarriedEnding } from "./endings.js";
+import { proxyNotDelivered, readCarriedEnding, type CarriedEnding } from "./endings.js";
 import { atMoment, msToNs, NS_PER_MS, type HopClock, type HopTimer, type PinnableCallClock } from "./hop-clock.js";
 import { checkKey, sameKey, type ProxyKey } from "./key.js";
 
@@ -154,25 +154,61 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 		conn.calls.set(invoke.request, controller);
 		inFlight++;
 		reviewIdle();
-		let ending: Promise<CallLayerEnding>;
+		const finishCall = (settledValue?: unknown, haveValue = false): void => {
+			try {
+				if (haveValue) {
+					// Read the caller's ending as plain data through readCarriedEnding (PX6, PX9; D54, D55).
+					// A deadline-passed ending has attempt null and is the proxy's own, not the call layer's.
+					const checked = readCarriedEnding(settledValue, invoke.invocation, invoke.operation);
+					if (checked !== undefined && checked.attempt !== null) send(conn, invoke.request, checked);
+				}
+			} finally {
+				conn.calls.delete(invoke.request);
+				callEnded();
+			}
+		};
+		let raw: unknown;
 		// The call's bound starts at the reading it was computed from, so its deadline is never later than `deadline`.
 		callClock.pin(now);
 		try {
-			ending = caller.invoke({
+			raw = caller.invoke({
 				host: invoke.host, service: invoke.service, operation: invoke.operation, input: invoke.input,
 				bound, invocation: invoke.invocation, repeat: invoke.repeat, signal: controller.signal,
 			});
 		} catch (error) {
-			ending = Promise.reject(error);
+			observePromises(error);
+			finishCall();
+			return;
 		} finally {
 			callClock.unpin();
 		}
-		Promise.resolve(ending).then((value) => send(conn, invoke.request, value), () => {
-			// A caller that rejects gives no ending to carry; the client half's deadline decides, as hop-stalled.
-		}).finally(() => {
-			conn.calls.delete(invoke.request);
-			callEnded();
-		}).catch(() => undefined);
+		let native = false;
+		try {
+			native = raw instanceof Promise;
+		} catch (error) {
+			observePromises(error);
+			observePromises(raw);
+			finishCall();
+			return;
+		}
+		if (!native) {
+			// A non-native thenable is not awaited (D54, D55); readCarriedEnding checks plain data and observes promises.
+			finishCall(raw, true);
+			return;
+		}
+		try {
+			Reflect.apply(Promise.prototype.then, raw, [
+				(value: unknown) => finishCall(value, true),
+				(error: unknown) => {
+					observePromises(error);
+					finishCall();
+				},
+			]);
+		} catch (error) {
+			observePromises(error);
+			observePromises(raw);
+			finishCall();
+		}
 	};
 
 	const close = (conn: Conn): void => {

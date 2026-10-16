@@ -101,7 +101,7 @@ test("only the machine's clock and runtime adapters read a clock or randomness; 
 });
 
 test("the package depends on operation-call through a file: link to the checkout beside it, and on nothing else at run time", () => {
-	assert.deepEqual(pkg.dependencies, { "@apnex/operation-call": "file:../operation-call" });
+	assert.deepEqual(pkg.dependencies, { "@apnex/operation-call": "file:../operation-call", "@apnex/shape-check": "file:../shape-check" });
 	for (const [name, spec] of Object.entries(pkg.devDependencies)) {
 		if (name.startsWith("@agp/") || name.startsWith("@apnex/")) assert.match(spec, /^file:\.\.\//, `${name} is linked from a checkout beside this one`);
 	}

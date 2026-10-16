@@ -9,7 +9,7 @@
  * writing, exactly as the call layer would refuse it, names the attempt identity it was refused as.
  * Nothing here is particular to one runtime.
  */
-import type { CallLayerEnding, CallLayerUnknownReason, DeliveryReport, HopNotDeliveredEnding, HopUnknownEnding, HopUnknownReason, JsonValue, RefusalRecord } from "@apnex/operation-call";
+import { readCallEnding, readRefusalRecord, type CallLayerEnding, type CallLayerUnknownReason, type DeliveryReport, type HopNotDeliveredEnding, type HopUnknownEnding, type HopUnknownReason, type JsonValue, type RefusalRecord } from "@apnex/operation-call";
 import { crossesAgp, isAttemptId, isInvocationId, NAME_PATTERN, readMessage, writeEnd, type EndContent } from "@apnex/operation-call/message-format";
 
 /** The proxy's codes on a `not-delivered` ending (PX2, PX5, PX6). */
@@ -55,8 +55,6 @@ export type DeadlinePassedEnding = ProxyNotDeliveredEnding & { readonly proxyCod
 /** The ending the proxy itself writes in an `end` message: the call layer's, or its `deadline-passed`. */
 export type CarriedEnding = CallLayerEnding | DeadlinePassedEnding;
 
-const REFUSAL_FIELDS = ["code", "details", "fix", "part", "what", "why"];
-const MISFIT_FIELDS = ["expected", "fit", "keyword", "pointer"];
 const UNKNOWN_REASONS: readonly CallLayerUnknownReason[] = ["bound-passed", "operation-failed", "answer-not-sendable"];
 
 /** True for a plain object, not null and not an array. */
@@ -70,20 +68,9 @@ export function hasExactly(value: { readonly [name: string]: unknown }, names: r
 	return own.length === names.length && names.every((n) => Object.hasOwn(value, n));
 }
 
-/** True when a value has exactly the form of EM9's refusal record, as the call layer checks it. */
+/** True when a value has exactly the form of EM9's refusal record as plain data (zorg's D54, D55). */
 export function isRefusalRecord(value: unknown): value is RefusalRecord {
-	if (!isObject(value)) return false;
-	const names = Object.keys(value).filter((n) => n !== "misfits").sort();
-	if (names.length !== REFUSAL_FIELDS.length || !names.every((n, i) => n === REFUSAL_FIELDS[i])) return false;
-	if (!["part", "code", "what", "why", "fix"].every((n) => typeof value[n] === "string")) return false;
-	if (!isObject(value.details)) return false;
-	if (!Object.hasOwn(value, "misfits")) return true;
-	const misfits = value.misfits;
-	return Array.isArray(misfits) && misfits.every((m) => {
-		if (!isObject(m)) return false;
-		const own = Object.keys(m).sort();
-		return own.length === 4 && own.every((n, i) => n === MISFIT_FIELDS[i]) && typeof m.pointer === "string" && typeof m.keyword === "string" && typeof m.fit === "string";
-	});
+	return readRefusalRecord(value).ok;
 }
 
 /**
@@ -99,53 +86,35 @@ function keepsCallLayerRules(invocation: string, attempt: string, operation: str
 }
 
 /**
- * Reads the `ending` of an `end` message (PX4): the call layer's ending as EM12 gives it - exactly its
- * fields, naming the invocation and the operation it was asked for, its answer or refusal keeping the call
- * layer's JSON, number and depth rules - or the proxy's `deadline-passed`. Anything else is undefined, which
- * breaks the channel's table.
+ * Reads the `ending` of an `end` message or a `CallLayerCaller.invoke` result as plain data through
+ * operation-call's `readCallEnding` and `readRefusalRecord` (PX4, PX6, PX9; zorg's D54, D55): the call layer's
+ * ending as EM12 gives it - exactly its fields, naming the invocation and the operation it was asked for, its
+ * answer or refusal keeping the call layer's JSON, number and depth rules - or the proxy's `deadline-passed`.
+ * Anything else is undefined (with any native promises observed by `readCallEnding`).
  */
 export function readCarriedEnding(value: unknown, invocation: string, operation: string): CarriedEnding | undefined {
-	if (!isObject(value) || value.invocation !== invocation || value.operation !== operation || !isInvocationId(invocation) || !NAME_PATTERN.test(operation)) return undefined;
-	const address = ["ending", "invocation", "attempt", "operation"];
-	const attempt = value.attempt;
-	const callAttempt = isAttemptId(attempt) && attempt.startsWith(`${invocation}.`);
-	switch (value.ending) {
+	const reading = readCallEnding(value);
+	if (!reading.ok || !isInvocationId(invocation) || !NAME_PATTERN.test(operation)) return undefined;
+	const ending = reading.ending;
+	if (ending.invocation !== invocation || ending.operation !== operation) return undefined;
+	const attempt = ending.attempt;
+	const callAttempt = typeof attempt === "string" && isAttemptId(attempt) && attempt.startsWith(`${invocation}.`);
+	switch (ending.ending) {
 		case "answered":
-			return callAttempt && hasExactly(value, [...address, "answer"]) && keepsCallLayerRules(invocation, attempt, operation, { outcome: "answered", answer: value.answer as JsonValue })
-				? value as unknown as CarriedEnding : undefined;
+			return callAttempt && keepsCallLayerRules(invocation, attempt, operation, { outcome: "answered", answer: ending.answer })
+				? (ending as CarriedEnding) : undefined;
 		case "refused":
-			return callAttempt && hasExactly(value, [...address, "refusal"]) && isRefusalRecord(value.refusal) && keepsCallLayerRules(invocation, attempt, operation, { outcome: "refused", refusal: value.refusal })
-				? value as unknown as CarriedEnding : undefined;
+			return callAttempt && keepsCallLayerRules(invocation, attempt, operation, { outcome: "refused", refusal: ending.refusal })
+				? (ending as CarriedEnding) : undefined;
 		case "not-delivered": {
-			if (!hasExactly(value, [...address, "agpCode", "proxyCode", "earlierAttemptsUncertain"]) || typeof value.earlierAttemptsUncertain !== "boolean") return undefined;
-			const ofCallLayer = callAttempt && typeof value.agpCode === "string" && value.proxyCode === null;
-			const ofProxy = attempt === null && value.agpCode === null && value.proxyCode === "deadline-passed";
-			return ofCallLayer || ofProxy ? value as unknown as CarriedEnding : undefined;
+			const ofCallLayer = callAttempt && typeof ending.agpCode === "string" && ending.proxyCode === null;
+			const ofProxy = attempt === null && ending.agpCode === null && ending.proxyCode === "deadline-passed";
+			return ofCallLayer || ofProxy ? (ending as CarriedEnding) : undefined;
 		}
 		case "unknown":
-			return callAttempt && hasExactly(value, [...address, "reason", "agpCode", "deliveryReport"])
-				&& UNKNOWN_REASONS.includes(value.reason as CallLayerUnknownReason)
-				&& (value.agpCode === null || typeof value.agpCode === "string")
-				&& (value.deliveryReport === null || value.deliveryReport === "delivered" || value.deliveryReport === "unknown")
-				? value as unknown as CarriedEnding : undefined;
-		default:
-			return undefined;
+			return callAttempt && UNKNOWN_REASONS.includes(ending.reason as CallLayerUnknownReason)
+				? (ending as CarriedEnding) : undefined;
 	}
-}
-
-/**
- * Deep-freezes an ending as it was read, so nothing that held the message can change it. It walks with a stack of
- * its own, never the call stack, so no nesting can overflow it.
- */
-export function freezeEnding<T extends ProxiedEnding>(ending: T): T {
-	const stack: unknown[] = [ending];
-	while (stack.length > 0) {
-		const value = stack.pop();
-		if (value === null || typeof value !== "object" || Object.isFrozen(value)) continue;
-		Object.freeze(value);
-		for (const member of Object.values(value)) stack.push(member);
-	}
-	return ending;
 }
 
 /** A `not-delivered` ending of the proxy's own code for an invocation (PX2, PX5, PX6). */

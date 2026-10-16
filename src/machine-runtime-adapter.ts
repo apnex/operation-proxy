@@ -10,7 +10,7 @@
  * succeeds for one process only - and removes its own, so `secret` only ever appears whole; every process
  * then reads `secret`, refusing one that is not exactly 33 bytes of that form. A key's channel is the socket
  * `<runtime directory>/<digest>.sock`, refused when its path would be longer than 107 bytes, and its
- * ownership the abstract-namespace socket `operation-proxy-<secret>-<digest>`.
+ * ownership the exclusive kernel lock on `<runtime directory>/<digest>.lock` (D57, D58).
  */
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -166,7 +166,43 @@ export function channelPath(dir: string, digest: string): string {
 	return socket;
 }
 
-/** A key's ownership socket, in the abstract namespace: `operation-proxy-<secret>-<digest>` (PX2, PX3). */
-export function ownershipName(secret: string, digest: string): string {
-	return `\0operation-proxy-${secret}-${digest}`;
+/** A key's ownership lock file inside the runtime directory: `<runtime directory>/<digest>.lock` (PX2, PX3; D57, D58). */
+export function ownershipPath(dir: string, digest: string): string {
+	return path.join(dir, `${digest}.lock`);
+}
+
+/** Alias kept for callers that pass `(dir, digest)`: `<dir>/<digest>.lock`. */
+export function ownershipName(dir: string, digest: string): string {
+	return ownershipPath(dir, digest);
+}
+
+/**
+ * Ensures `<runtime directory>/<digest>.lock` exists as a regular file owned by this user with mode 0600,
+ * refusing a symbolic link, non-regular file, wrong owner or group/other permissions as `RuntimeUnsafe` (PX2, PX3).
+ */
+export function ensureLockFile(lockPath: string, system: DirectorySystem = MACHINE): void {
+	let stat: fs.Stats;
+	try {
+		stat = fs.lstatSync(lockPath);
+	} catch (error) {
+		if (codeOf(error) !== "ENOENT") throw new RuntimeUnsafe("unusable", `the ownership lock ${lockPath} cannot be examined`, { cause: error });
+		try {
+			const fd = fs.openSync(lockPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+			try {
+				fs.fchmodSync(fd, 0o600);
+			} finally {
+				fs.closeSync(fd);
+			}
+		} catch (made) {
+			if (codeOf(made) !== "EEXIST") throw new RuntimeUnsafe("unusable", `the ownership lock ${lockPath} cannot be created`, { cause: made });
+		}
+		try {
+			stat = fs.lstatSync(lockPath);
+		} catch (again) {
+			throw new RuntimeUnsafe("unusable", `the ownership lock ${lockPath} cannot be examined`, { cause: again });
+		}
+	}
+	if (!stat.isFile()) throw new RuntimeUnsafe("unusable", `the ownership lock ${lockPath} is not a regular file`);
+	if (stat.uid !== system.uid()) throw new RuntimeUnsafe("not-owned", `the ownership lock ${lockPath} is not owned by this user`);
+	if ((stat.mode & 0o077) !== 0) throw new RuntimeUnsafe("open-to-others", `the ownership lock ${lockPath} grants permissions to its group or to others`);
 }

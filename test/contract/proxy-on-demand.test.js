@@ -110,3 +110,17 @@ test("the proxy is launched detached from its client with its output discarded, 
 	assert.equal((await f.client({ operation: "which" }).ack()).ending.answer.pid, pid, "a later command reaches it");
 });
 
+test("D3-E2, PX3: after a serving proxy is killed with SIGKILL, 20 concurrent starters leave exactly one new owner", { timeout: 120_000 }, async () => {
+	const f = make();
+	const first = await f.client({ operation: "which" }).ack();
+	assert.equal(first.ending.ending, "answered");
+	const victim = first.ending.answer.pid;
+	process.kill(victim, "SIGKILL");
+	await waitFor(() => !alive(victim), "the victim to die");
+	const clients = Array.from({ length: 20 }, () => f.client({ operation: "which", connectMs: 30_000, bound: 30_000 }));
+	const acks = await Promise.all(clients.map((c) => c.ack(90_000)));
+	for (const ack of acks) assert.equal(ack.ending.ending, "answered", JSON.stringify(ack.ending));
+	const newOwners = f.owners().filter((pid) => pid !== victim);
+	assert.equal(newOwners.length, 1, `exactly one replacement owner, not ${JSON.stringify(newOwners)}`);
+	assert.deepEqual([...new Set(acks.map((a) => a.ending.answer.pid))], newOwners);
+});

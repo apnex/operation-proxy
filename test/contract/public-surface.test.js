@@ -46,14 +46,15 @@ const contractRows = () => {
 	return rows;
 };
 
-test("every contract row is served by an export and none deferred; the browser adapter of PX8 is deferred, with its ruling", () => {
+test("every contract row is served by an export and none deferred; both the machine and browser adapters are built (D57)", () => {
 	const rows = contractRows();
 	assert.deepEqual(rows, FENCED, "the six rows zorg's Delta 1 fences, as CONTRACT.md lists them");
 	const served = new Set(Object.values(map.paths).flatMap((e) => Object.values(e.exports)).flatMap((x) => x.serves));
 	for (const row of rows) assert.ok(served.has(row), `${row} is served`);
 	for (const row of served) assert.ok(rows.includes(row), `${row} is not a row of CONTRACT.md`);
-	assert.deepEqual(map.deferred, { "browser-adapter": "D31" }, "only the browser adapter, declared by PX8 and not built (zorg's D31)");
-	assert.match(fs.readFileSync(path.join(root, "CONTRACT.md"), "utf8"), /\*\*PX8 - The browser adapter, declared\.\*\*/);
+	assert.deepEqual(map.deferred, {}, "no deferred entry remains in Delta 3 (zorg's D57)");
+	assert.match(fs.readFileSync(path.join(root, "CONTRACT.md"), "utf8"), /\*\*PX8 - The browser adapter \(`D57`\)\.\*\*/);
+	assert.ok(fs.existsSync(path.join(root, "test", "contract", "browser-adapter.test.js")), "browser-adapter.test.js");
 });
 
 test("every fenced row has a contract test file named for it", () => {
@@ -66,7 +67,7 @@ const imports = (text) => [...text.matchAll(/\bimport\s+(type\s+)?[^;]*?\bfrom\s
 	.map((m) => ({ typeOnly: Boolean(m[1] || m[4]), specifier: m[2] ?? m[3] ?? m[5] ?? m[6] }));
 const code = (text) => text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'\\])\/\/.*$/gm, "$1");
 const builtins = new Set(builtinModules.flatMap((m) => [m, `node:${m}`]));
-const ADAPTERS = ["machine-adapter.ts", "machine-channel-adapter.ts", "machine-clock-adapter.ts", "machine-runtime-adapter.ts"];
+const ADAPTERS = ["browser-adapter.ts", "machine-adapter.ts", "machine-channel-adapter.ts", "machine-clock-adapter.ts", "machine-runtime-adapter.ts"];
 
 test("no source file imports a module particular to one runtime outside a file whose name ends -adapter.ts, or uses a global particular to Node", () => {
 	const files = tsSources();
@@ -79,7 +80,7 @@ test("no source file imports a module particular to one runtime outside a file w
 		assert.deepEqual(runtime, [], `${path.relative(root, file)} imports ${runtime.join(", ")}`);
 		assert.doesNotMatch(code(text), /\b(process|Buffer|__dirname|__filename|setImmediate|setTimeout|setInterval)\b|\brequire\s*\(/, `${path.relative(root, file)} uses a global particular to Node or a timer of its own`);
 		const machine = imports(text).map((i) => i.specifier).filter((s) => /-adapter\.js$/.test(s));
-		if (path.basename(file) !== "machine.ts") assert.deepEqual(machine, [], `${path.relative(root, file)} reaches an adapter`);
+		if (!["machine.ts", "browser.ts"].includes(path.basename(file))) assert.deepEqual(machine, [], `${path.relative(root, file)} reaches an adapter`);
 	}
 });
 
@@ -95,7 +96,7 @@ test("only the machine's clock and runtime adapters read a clock or randomness; 
 	for (const file of tsSources()) {
 		const text = code(fs.readFileSync(file, "utf8"));
 		const reads = /Date\.now\s*\(|new Date\s*\(\s*\)|performance\.now|hrtime|Temporal\.Now|Math\.random|getRandomValues|randomBytes/.test(text);
-		const allowed = ["machine-clock-adapter.ts", "machine-runtime-adapter.ts"].includes(path.basename(file));
+		const allowed = ["browser-adapter.ts", "machine-clock-adapter.ts", "machine-runtime-adapter.ts"].includes(path.basename(file));
 		if (!allowed) assert.equal(reads, false, `${path.relative(root, file)} reads a clock or randomness`);
 	}
 });

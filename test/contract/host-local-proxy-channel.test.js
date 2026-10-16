@@ -249,7 +249,7 @@ test("the proxy listens on no network port: its sockets are its Unix channel soc
 	const pid = (await f.client({ operation: "which" }).ack()).ending.answer.pid;
 	const inodes = new Set(fs.readdirSync(`/proc/${pid}/fd`).map((fd) => { try { return fs.readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { return ""; } })
 		.map((l) => /^socket:\[(\d+)\]$/.exec(l)?.[1]).filter(Boolean));
-	assert.ok(inodes.size >= 2);
+	assert.ok(inodes.size >= 1);
 	for (const table of ["tcp", "tcp6", "udp", "udp6", "raw", "raw6", "udplite", "udplite6"]) {
 		let lines = [];
 		try { lines = fs.readFileSync(`/proc/net/${table}`, "utf8").trim().split("\n").slice(1); } catch { continue; }
@@ -257,9 +257,11 @@ test("the proxy listens on no network port: its sockets are its Unix channel soc
 	}
 	const unix = fs.readFileSync("/proc/net/unix", "utf8").trim().split("\n").slice(1).map((l) => l.trim().split(/\s+/));
 	const mine = unix.filter((cols) => inodes.has(cols[6])).map((cols) => cols[7]).filter(Boolean);
-	const secret = fs.readFileSync(path.join(f.config.runtimeDir, "secret"), "latin1").trim();
 	assert.ok(mine.includes(f.socketPath()), "it listens on the channel socket");
-	assert.ok(mine.includes(`@operation-proxy-${secret}-${f.digest}`), "it holds the ownership socket, named with the secret");
+	assert.ok(!mine.some((p) => p.startsWith("@operation-proxy-")), "no abstract-namespace socket in /proc/net/unix");
+	const lockStat = fs.lstatSync(path.join(f.config.runtimeDir, `${f.digest}.lock`));
+	assert.ok(lockStat.isFile(), "the ownership lock is a regular file in the runtime directory");
+	assert.equal(lockStat.mode & 0o777, 0o600, "the ownership lock has mode 0600");
 });
 
 test("commands of one key run with different HOME, TMPDIR and XDG_RUNTIME_DIR settings find one proxy, in the runtime directory the user database names", { timeout: 120_000 }, async () => {
@@ -285,67 +287,66 @@ test("commands of one key run with different HOME, TMPDIR and XDG_RUNTIME_DIR se
 });
 
 /** The inodes of the sockets a process holds open. */
-function socketInodes(pid) {
-	return new Set(fs.readdirSync(`/proc/${pid}/fd`).map((fd) => { try { return fs.readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { return ""; } })
-		.map((l) => /^socket:\[(\d+)\]$/.exec(l)?.[1]).filter(Boolean));
-}
-
-/**
- * Every abstract-namespace socket /proc/net/unix lists under a key's ownership name, found by its digest alone -
- * the pattern PX2 gives, with any 32 hexadecimal digits for the secret - as `{ name, inode }`. The table is read
- * as any user of the machine may read it; a machine where it cannot be read fails the case, never skips it.
- */
-function ownershipEntries(digest) {
-	let table;
+/** True while the exclusive kernel lock on `lockPath` is held by some process. */
+async function lockHeld(lockPath) {
+	const orig = process.emitWarning;
+	process.emitWarning = (w, ...args) => { if (String(w).includes("SQLite")) return; return orig.call(process, w, ...args); };
+	const { DatabaseSync } = await import("node:sqlite");
+	process.emitWarning = orig;
+	let db;
 	try {
-		table = fs.readFileSync("/proc/net/unix", "utf8");
-	} catch (error) {
-		assert.fail(`/proc/net/unix cannot be read, so the held name cannot be shown: ${error.code ?? error}`);
+		db = new DatabaseSync(lockPath, { timeout: 0 });
+		db.exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS own (x INT); INSERT INTO own VALUES (1);");
+		db.close();
+		return false;
+	} catch {
+		try { db?.close(); } catch { /* ignore */ }
+		return true;
 	}
-	const pattern = new RegExp(`^@operation-proxy-[0-9a-f]{32}-${digest}$`);
-	return table.trim().split("\n").slice(1).map((l) => l.trim().split(/\s+/))
-		.filter((cols) => cols[7] !== undefined && pattern.test(cols[7])).map((cols) => ({ name: cols[7], inode: cols[6] }));
 }
 
-// This case runs under one user: it shows that a process holding a key's ownership name denies the key's proxy
-// its start, and what a client then sees - not a crossing between users. That another user can read the name
-// and hold it is PX2's reading of Linux (zorg's D53); nothing here acts as another user, and no other user
-// enters the runtime directory, which the cases above check.
-test("a running proxy's ownership name is found in /proc/net/unix without the secret; held by a process that is no proxy once the proxy stops, a client writes no invocation and ends once, at its connect deadline, not-delivered with proxy-unreachable; released, the next command starts a proxy", { timeout: 180_000 }, async () => {
+test("D3-E2, PX2, PX3: a symbolic link at <digest>.lock is refused as runtime-dir-unsafe", async () => {
+	const dir = path.join(temp(), "rt");
+	ensureRuntime(dir);
+	const lockPath = path.join(dir, `${keyDigest(KEY)}.lock`);
+	const target = path.join(temp(), "target.lock");
+	fs.writeFileSync(target, "");
+	fs.symlinkSync(target, lockPath);
+	const { startMachineProxyIn } = await import("../../dist/machine-adapter.js");
+	await assert.rejects(
+		() => startMachineProxyIn(dir, { key: KEY, idleMs: 60_000, buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }), callerReady: () => undefined }),
+		(err) => err instanceof RuntimeUnsafe && err.reason === "unusable",
+	);
+});
+
+test("D3-E2, PX2, PX3: a running proxy holds <digest>.lock inside the mode-0700 runtime directory with nothing in /proc/net/unix; held by a process that is no proxy once the proxy stops, a client writes no invocation and ends once, at its connect deadline, not-delivered with proxy-unreachable; released, the next command starts a proxy", { timeout: 180_000 }, async () => {
 	const f = fixture();
 	fixtures.push(f);
 	const served = await f.client({ operation: "which", connectMs: 20_000 }).ack(60_000);
 	assert.equal(served.ending.ending, "answered", JSON.stringify(served.ending));
 	const owner = served.ending.answer.pid;
-	// Found by the key's digest in the kernel's table, without reading the runtime directory's secret file.
-	const found = ownershipEntries(f.digest);
-	const names = [...new Set(found.map((e) => e.name))];
-	assert.equal(names.length, 1, `one ownership name for the key, not ${JSON.stringify(names)}`);
-	const [name] = names;
-	const ownerSockets = socketInodes(owner);
-	assert.ok(found.some((e) => ownerSockets.has(e.inode)), "the name found is held by the running proxy");
+	const lockPath = path.join(f.config.runtimeDir, `${f.digest}.lock`);
+	assert.equal(await lockHeld(lockPath), true, "the lock is held by the running proxy");
+	assert.equal(fs.readFileSync("/proc/net/unix", "utf8").includes("@operation-proxy-"), false, "no abstract-namespace socket in /proc/net/unix");
 
 	process.kill(owner, "SIGTERM");
 	await waitFor(() => !alive(owner), "the proxy to stop");
-	await waitFor(() => ownershipEntries(f.digest).length === 0, "the stopped proxy's name to be free");
+	await waitFor(async () => !(await lockHeld(lockPath)), "the stopped proxy's lock to be free");
 	assert.ok(!fs.existsSync(f.socketPath()), "the stopped proxy removed its channel socket");
 
 	const ackDir = temp();
-	const holder = spawn(process.execPath, [HOLD_NAME_MAIN, name.slice(1), ackDir], { stdio: "ignore" });
+	const holder = spawn(process.execPath, [HOLD_NAME_MAIN, lockPath, ackDir], { stdio: "ignore" });
 	const holderExited = new Promise((resolve) => holder.once("exit", (code, signal) => resolve({ code, signal })));
 	const clients = [];
 	try {
-		await waitFor(() => fs.existsSync(path.join(ackDir, "listening")) || fs.existsSync(path.join(ackDir, "failed")), "the holder to listen");
-		assert.ok(!fs.existsSync(path.join(ackDir, "failed")), "the holder took the free name");
-		const holderSockets = socketInodes(holder.pid);
-		assert.ok(ownershipEntries(f.digest).some((e) => e.name === name && holderSockets.has(e.inode)), "the name is held by the process that is no proxy");
+		await waitFor(() => fs.existsSync(path.join(ackDir, "listening")) || fs.existsSync(path.join(ackDir, "failed")), "the holder to lock");
+		assert.ok(!fs.existsSync(path.join(ackDir, "failed")), "the holder took the free lock");
+		assert.equal(await lockHeld(lockPath), true, "the lock is held by the process that is no proxy");
 
 		const connectMs = 1500;
-		// A command as zorg's runs it: preparing within its connect time, invoking only once welcomed.
 		const command = f.client({ operation: "echo", input: "command", connectMs, natural: true });
 		clients.push(command);
 		const commanded = await command.ack(60_000);
-		// An invocation made unprepared, waiting for a proxy until its connect deadline, its bound's.
 		const invocation = f.client({ operation: "echo", input: "invocation", connectMs: null, bound: connectMs });
 		clients.push(invocation);
 		const invoked = await invocation.ack(60_000);
@@ -358,36 +359,29 @@ test("a running proxy's ownership name is found in /proc/net/unix without the se
 		assert.match(invoked.ending.invocation, /^\d{13}-[0-9a-f]{16}$/, "the invocation's own identity");
 		assert.ok(invoked.elapsedMs >= connectMs - 5, `the invocation ended at its connect deadline, not before: ${invoked.elapsedMs} ms`);
 		assert.ok(invoked.elapsedMs < connectMs + 10_000, `the invocation ended at its connect deadline, not long after: ${invoked.elapsedMs} ms`);
-		// Ended once: the command, left to end by itself, exits with nothing of its client half still waiting.
 		let waiting;
 		const exit = await Promise.race([command.exited, new Promise((resolve) => { waiting = setTimeout(() => resolve("still running"), 30_000); })]);
 		clearTimeout(waiting);
 		assert.deepEqual(exit, { code: 0, signal: null }, "the command exits by itself once its one ending is given");
 
-		// Nothing of either invocation was written: no channel socket was there to write to, the holder read
-		// nothing, no proxy took the key and nothing reached the fixture host; the clients did launch the proxy's
-		// command, and each proxy started found the name held and exited with 0, touching nothing.
 		assert.ok(!fs.existsSync(f.socketPath()), "no channel socket");
-		assert.ok(!fs.existsSync(path.join(ackDir, "received")), "the holder was given no connection and read nothing");
 		const starters = f.started().filter((pid) => pid !== owner);
 		assert.ok(starters.length >= 2, `each client launched the proxy's command: ${starters.length} started`);
 		for (const pid of starters) await waitFor(() => f.exits().has(pid), `starter ${pid} to exit`);
 		for (const pid of starters) assert.equal(f.exits().get(pid), 0, `starter ${pid} exited with 0`);
-		assert.deepEqual(f.owners(), [owner], "no proxy took the key while the name was held");
+		assert.deepEqual(f.owners(), [owner], "no proxy took the key while the lock was held");
 		assert.deepEqual(f.runs().filter((r) => r.operation === "echo"), [], "nothing reached the fixture host");
 	} finally {
-		// A client that has not ended by now is killed, so a failure leaves nothing running.
 		for (const client of clients) if (client.child.exitCode === null && client.child.signalCode === null) client.child.kill("SIGKILL");
-		holder.kill("SIGTERM");
+		holder.kill("SIGKILL");
 		await holderExited;
 	}
 
-	await waitFor(() => ownershipEntries(f.digest).length === 0, "the released name to be free");
+	await waitFor(async () => !(await lockHeld(lockPath)), "the released lock to be free");
 	const next = await f.client({ operation: "which", connectMs: 20_000 }).ack(60_000);
 	assert.equal(next.ending.ending, "answered", JSON.stringify(next.ending));
 	const started = next.ending.answer.pid;
 	assert.notEqual(started, owner, "a new proxy");
 	assert.ok(f.owners().includes(started), "the new proxy took the key");
-	const startedSockets = socketInodes(started);
-	assert.ok(ownershipEntries(f.digest).some((e) => e.name === name && startedSockets.has(e.inode)), "under the same name the holder held");
+	assert.equal(await lockHeld(lockPath), true, "under the same lock file");
 });

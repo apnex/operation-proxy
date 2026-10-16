@@ -116,13 +116,24 @@ function quickApplication(key, idleMs, log) {
 	};
 }
 
-/** True while an abstract-namespace name is held by some process. */
-function held(name) {
-	return new Promise((resolve) => {
-		const server = net.createServer();
-		server.once("error", () => resolve(true));
-		server.listen({ path: name, exclusive: true }, () => server.close(() => resolve(false)));
-	});
+const origEmitWarning = process.emitWarning;
+process.emitWarning = (w, ...args) => { if (String(w).includes("SQLite")) return; return origEmitWarning.call(process, w, ...args); };
+const { DatabaseSync } = await import("node:sqlite");
+process.emitWarning = origEmitWarning;
+
+/** True while `<runtime directory>/<digest>.lock` is held by some owner, checked synchronously at the moment of the call. */
+function held(lockPath) {
+	if (!fs.existsSync(lockPath)) return Promise.resolve(false);
+	let db;
+	try {
+		db = new DatabaseSync(lockPath, { timeout: 0 });
+		db.exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS own (x INT); INSERT INTO own VALUES (1);");
+		db.close();
+		return Promise.resolve(false);
+	} catch {
+		try { db?.close(); } catch { /* ignore */ }
+		return Promise.resolve(true);
+	}
 }
 
 test("at the idle boundary: a connection the kernel has accepted, not yet taken by the proxy, waiting as the idle timer's first due callback runs, is taken before the proxy checks again, and the same owner stays and serves it", { timeout: 60_000 }, async () => {
@@ -154,7 +165,7 @@ test("at the idle boundary: a connection the kernel has accepted, not yet taken 
 	}, 0));
 	const log = [];
 	const proxy = await startMachineProxyIn(dir, quickApplication(key, idleMs, (w) => log.push(w)), { clock, observe: (stage) => log.push(stage) });
-	const name = ownershipName(ensureRuntime(dir), keyDigest(key));
+	const name = ownershipName(dir, keyDigest(key));
 	const ackDir = shortTempDir();
 	let child;
 	try {
@@ -202,7 +213,7 @@ test("stopping when idle: it stops accepting, closes connections not welcomed, r
 		checks = Promise.all([held(name), Promise.resolve(fs.existsSync(socketPath))]);
 	});
 	const proxy = await startMachineProxyIn(dir, application, { clock, observe: (stage) => log.push(stage) });
-	name = ownershipName(ensureRuntime(dir), keyDigest(key));
+	name = ownershipName(dir, keyDigest(key));
 	assert.equal(proxy.owner, true);
 	await until(() => log.includes("ready"), "ready");
 	const unwelcomed = await rawConnection(socketPath);
@@ -274,7 +285,7 @@ async function stoppingDespite(what, inject, stop) {
 	const restore = inject(socketPath);
 	try {
 		const proxy = await startMachineProxyIn(dir, quickApplication(key, 1000, (w) => log.push(w)), { clock, observe: (stage) => log.push(stage) });
-		const name = ownershipName(ensureRuntime(dir), keyDigest(key));
+		const name = ownershipName(dir, keyDigest(key));
 		await until(() => log.includes("ready"), "ready");
 		let status;
 		proxy.stopped.then((s) => { status = s; });
@@ -326,15 +337,24 @@ test("stopping despite a failure to remove the channel socket: the caller still 
 test("stopping despite a failure to close the channel's server, and to release ownership cleanly: the caller still stops, ownership is released, stopped resolves with status 1, and a later start owns the key", async () => {
 	for (const which of ["channel", "ownership"]) {
 		await stoppingDespite(`a ${which} close failure`, (socketPath) => {
-			const close = net.Server.prototype.close;
-			net.Server.prototype.close = function (callback) {
-				const address = this.address();
-				const mine = which === "channel" ? address === socketPath : typeof address === "string" && address.startsWith("\0operation-proxy-") && address.endsWith(path.basename(socketPath, ".sock"));
-				if (!mine) return close.call(this, callback);
-				// The server does close; its callback reports a failure, as closing a server can.
-				return close.call(this, () => callback?.(Object.assign(new Error(`injected ${which} close failure`), { code: "EIO" })));
+			if (which === "channel") {
+				const close = net.Server.prototype.close;
+				net.Server.prototype.close = function (callback) {
+					if (this.address() !== socketPath) return close.call(this, callback);
+					return close.call(this, () => callback?.(Object.assign(new Error("injected channel close failure"), { code: "EIO" })));
+				};
+				return () => { net.Server.prototype.close = close; };
+			}
+			const close = DatabaseSync.prototype.close;
+			let thrown = false;
+			DatabaseSync.prototype.close = function () {
+				close.call(this);
+				if (!thrown) {
+					thrown = true;
+					throw Object.assign(new Error("injected ownership close failure"), { code: "EIO" });
+				}
 			};
-			return () => { net.Server.prototype.close = close; };
+			return () => { DatabaseSync.prototype.close = close; };
 		}, (_proxy, clock) => clock.advance(1000));
 	}
 });
@@ -376,7 +396,7 @@ async function failingAt({ stage, callerStop }) {
 			await until(() => status !== undefined, "stopped to resolve");
 		}
 		await settle();
-		const name = ownershipName(ensureRuntime(dir), keyDigest(key));
+		const name = ownershipName(dir, keyDigest(key));
 		const result = { startError, status, stages, log, listening: servers.filter((server) => server.listening).length, owned: await held(name), socket: fs.existsSync(path.join(dir, `${keyDigest(key)}.sock`)), rejections: [...rejections] };
 		net.Server.prototype.listen = listen;
 		await ownedAgain(dir, key, stage ?? "a caller that fails to stop");
@@ -464,7 +484,7 @@ async function startFailingOnClock(kind, failAt) {
 		assert.equal(clock.pending(), 0, `${what}: no timer live as the failure is given`);
 		assert.equal(servers.filter((server) => server.listening).length, 0, `${what}: no server listening as the failure is given, the channel's nor ownership's`);
 		net.Server.prototype.listen = listen;
-		assert.equal(await held(ownershipName(ensureRuntime(dir), keyDigest(key))), false, `${what}: ownership released`);
+		assert.equal(await held(ownershipName(dir, keyDigest(key))), false, `${what}: ownership released`);
 		assert.equal(fs.existsSync(path.join(dir, `${keyDigest(key)}.sock`)), false, `${what}: no channel socket left`);
 		// Past the idle time, several times over: nothing fires, nothing throws.
 		assert.doesNotThrow(() => clock.advance(5000), `${what}: running past the idle time raises nothing`);
@@ -518,7 +538,7 @@ test("on the system's own clock, a start whose call clock's origin reading throw
 		await assert.rejects(startMachineProxyIn(dir, quickApplication(key, 1000, () => undefined), { clock: port, observe: (stage) => { if (stage === "listening") originNext = true; } }), /call clock origin unavailable/);
 		assert.equal(servers.filter((server) => server.listening).length, 0, "no server listening as the failure is given");
 		net.Server.prototype.listen = listen;
-		assert.equal(await held(ownershipName(ensureRuntime(dir), keyDigest(key))), false, "ownership released at once");
+		assert.equal(await held(ownershipName(dir, keyDigest(key))), false, "ownership released at once");
 		// The idle time is 1 second; three are waited, for a loaded machine.
 		await sleep(3000);
 		assert.deepEqual(uncaught.map(String), [], "nothing thrown past the idle time");

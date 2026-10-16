@@ -35,8 +35,8 @@ test("PX1: two keys differing only in target get two proxies, each owning its ow
 	assert.notEqual(a.ending.answer.pid, b.ending.answer.pid, "two proxies");
 	assert.ok(fs.existsSync(one.socketPath()) && fs.existsSync(two.socketPath()) && one.socketPath() !== two.socketPath());
 	const unix = fs.readFileSync("/proc/net/unix", "utf8");
-	const secret = fs.readFileSync(path.join(one.config.runtimeDir, "secret"), "utf8").trim();
-	for (const f of [one, two]) assert.ok(unix.includes(`@operation-proxy-${secret}-${f.digest}`), `the ownership socket of ${f.digest}`);
+	assert.ok(!unix.includes("@operation-proxy-"), "no abstract-namespace socket in /proc/net/unix");
+	for (const f of [one, two]) assert.ok(fs.existsSync(path.join(one.config.runtimeDir, `${f.digest}.lock`)), `the ownership lock of ${f.digest}`);
 });
 
 test("PX1: one key used from 20 processes gets one proxy, its one caller carrying them all under the key's identity", { timeout: 120_000 }, async () => {

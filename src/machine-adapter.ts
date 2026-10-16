@@ -27,7 +27,7 @@ import { callClockOf, type HopClock, type PinnableCallClock } from "./hop-clock.
 import { checkKey, keyDigest, type ProxyKey } from "./key.js";
 import { connectChannel, listenChannel, socketLink } from "./machine-channel-adapter.js";
 import { machineClock, machineIdentities } from "./machine-clock-adapter.js";
-import { channelPath, ensureRuntime, ownershipName, runtimeDirectory, RuntimeUnsafe } from "./machine-runtime-adapter.js";
+import { channelPath, ensureLockFile, ensureRuntime, ownershipPath, runtimeDirectory, RuntimeUnsafe } from "./machine-runtime-adapter.js";
 import { checkIdleTime, createProxyHalf, type CallLayerCaller, type ProxyHalf } from "./proxy-half.js";
 
 /** The command that launches an application's proxy (PX3, PX9). */
@@ -141,16 +141,56 @@ export function createMachineClientIn(dir: string, application: MachineClientApp
 	});
 }
 
-/** Listens on the key's ownership socket: the server, or undefined when another process holds it (PX3). */
-function own(name: string): Promise<net.Server | undefined> {
-	return new Promise((resolve, reject) => {
-		const server = net.createServer((socket) => socket.destroy());
-		server.once("error", (error: NodeJS.ErrnoException) => {
-			if (error.code === "EADDRINUSE") resolve(undefined);
-			else reject(error);
-		});
-		server.listen({ path: name, exclusive: true }, () => resolve(server));
-	});
+/** An acquired exclusive kernel lock on `<runtime directory>/<digest>.lock` (PX2, PX3; D57, D58). */
+interface OwnershipLock {
+	close(): Promise<void>;
+}
+
+/** Loads Node's built-in `DatabaseSync` without emitting its experimental warning on standard error. */
+async function loadDatabaseSync(): Promise<new (path: string, options?: { timeout?: number }) => { exec(sql: string): void; close(): void }> {
+	const orig = process.emitWarning;
+	process.emitWarning = ((warning: string | Error, ...args: unknown[]) => {
+		if (String(warning).includes("SQLite")) return;
+		return (orig as (...a: unknown[]) => unknown).call(process, warning, ...args);
+	}) as typeof process.emitWarning;
+	try {
+		const mod = await import("node:sqlite");
+		return mod.DatabaseSync;
+	} finally {
+		process.emitWarning = orig;
+	}
+}
+
+/** Acquires the exclusive kernel lock on `<runtime directory>/<digest>.lock`, or returns undefined when held (PX3). */
+async function own(lockPath: string): Promise<OwnershipLock | undefined> {
+	ensureLockFile(lockPath);
+	const DatabaseSync = await loadDatabaseSync();
+	let db: { exec(sql: string): void; close(): void };
+	try {
+		db = new DatabaseSync(lockPath, { timeout: 0 });
+	} catch {
+		return undefined;
+	}
+	try {
+		db.exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS own (x INT); INSERT INTO own VALUES (1);");
+	} catch {
+		try {
+			db.close();
+		} catch {
+			// Closing a failed attempt leaves nothing held.
+		}
+		return undefined;
+	}
+	return {
+		close: () => new Promise<void>((resolve, reject) => {
+			try {
+				db.close();
+				resolve();
+			} catch (error) {
+				reject(error);
+			}
+		}),
+	};
 }
 
 /** Closes a server: resolves once it is closed, and rejects when closing it fails. */
@@ -179,9 +219,10 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	if (typeof application.buildCaller !== "function" || typeof application.callerReady !== "function") throw new TypeError("an application supplies buildCaller and callerReady");
 	const clock = options.clock ?? machineClock;
 	const observe = (stage: ProxyStage): void => options.observe?.(stage);
-	const secret = ensureRuntime(dir);
+	ensureRuntime(dir);
 	const digest = keyDigest(key);
 	const socketPath = channelPath(dir, digest);
+	const lockPath = ownershipPath(dir, digest);
 
 	const sockets = new Set<net.Socket>();
 	let stopping = false;
@@ -206,9 +247,9 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		handlers = half.accept(link);
 	};
 
-	const ownership = await own(ownershipName(secret, digest));
+	const ownership = await own(lockPath);
 	if (ownership === undefined) return Object.freeze({ owner: false, stopped: Promise.resolve(0), stop: () => undefined });
-	const held: net.Server = ownership;
+	const held: OwnershipLock = ownership;
 	let server: net.Server | undefined;
 	let callClock: PinnableCallClock;
 	try {
@@ -439,7 +480,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 			await step(() => closeServer(opened));
 			await step(() => fs.rmSync(socketPath, { force: true }));
 		}
-		await step(() => closeServer(held));
+		await step(() => held.close());
 	}
 
 	/**
@@ -498,7 +539,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		await step(() => building, false);
 		await step(() => built?.stop(), false);
 		await step(() => observe("caller-stopped"));
-		await step(() => closeServer(held));
+		await step(() => held.close());
 		await step(() => observe("stopped"));
 		return failed ? 1 : status;
 	}

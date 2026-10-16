@@ -23,6 +23,10 @@
     "./machine": {
       "types": "./dist/machine.d.ts",
       "default": "./dist/machine.js"
+    },
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "default": "./dist/browser.js"
     }
   },
   "files": [

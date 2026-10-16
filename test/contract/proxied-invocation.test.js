@@ -1362,6 +1362,22 @@ test("D2-E4, PX4, PX5, PX6, PX9, D54, D55: src/call-checks.ts is removed; CallRe
 					callerReady: () => undefined,
 				},
 				{
+					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, get extra() { getters++; return 1; } }),
+					callerReady: () => undefined,
+				},
+				{
+					buildCaller: () => Object.defineProperty({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }, "hidden", { value: 1, enumerable: false }),
+					callerReady: () => undefined,
+				},
+				{
+					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, [Symbol("extra")]: 1 }),
+					callerReady: () => undefined,
+				},
+				{
+					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: { p: Promise.reject(new Error("buildCaller extra nested promise")) } }),
+					callerReady: () => undefined,
+				},
+				{
 					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }),
 					callerReady: () => ({ then(resolve) { getters++; resolve(undefined); }, p: Promise.reject(new Error("callerReady thenable promise")) }),
 				},

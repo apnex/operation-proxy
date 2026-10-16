@@ -263,19 +263,64 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 			throw error;
 		}
 	};
-	/** Validates a settled `buildCaller` result without invoking getters or `then`. */
+	/**
+	 * Validates a settled `buildCaller` result without invoking getters or `then` (PX9; D54, D55): the outer
+	 * record and `caller` are plain objects with own enumerable data descriptors only and no symbols, `then` or
+	 * promises, `caller.invoke` and `stop` are functions, and any plain object or array reachable from the
+	 * record's own properties holds only own enumerable data descriptors with no symbols, getters or promises.
+	 */
 	const validBuiltCaller = (candidate: unknown): candidate is ProxiedCaller => {
 		if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
 		try {
-			const proto = Object.getPrototypeOf(candidate);
-			if (proto !== Object.prototype && proto !== null) return false;
-			if (Object.getOwnPropertyDescriptor(candidate, "then") !== undefined) return false;
+			const checkPlainContainer = (obj: object, forbidThen: boolean, queue: object[]): boolean => {
+				if (obj instanceof Promise) return false;
+				if (Object.getOwnPropertySymbols(obj).length > 0) return false;
+				const proto = Object.getPrototypeOf(obj);
+				if (Array.isArray(obj)) {
+					if (proto !== Array.prototype) return false;
+					const names = Object.getOwnPropertyNames(obj);
+					const lenDesc = Object.getOwnPropertyDescriptor(obj, "length");
+					if (lenDesc === undefined || !Object.hasOwn(lenDesc, "value") || typeof lenDesc.value !== "number" || names.length !== lenDesc.value + 1) return false;
+					for (let i = 0; i < lenDesc.value; i++) {
+						const d = Object.getOwnPropertyDescriptor(obj, String(i));
+						if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value")) return false;
+						if (d.value instanceof Promise) return false;
+						if (d.value !== null && typeof d.value === "object") queue.push(d.value);
+					}
+					return true;
+				}
+				if (proto !== Object.prototype && proto !== null) return false;
+				for (const name of Object.getOwnPropertyNames(obj)) {
+					if (forbidThen && name === "then") return false;
+					const d = Object.getOwnPropertyDescriptor(obj, name);
+					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value")) return false;
+					if (d.value instanceof Promise) return false;
+					if (d.value !== null && typeof d.value === "object") {
+						const childProto = Object.getPrototypeOf(d.value);
+						if (d.value instanceof Promise || childProto === Object.prototype || childProto === null || Array.isArray(d.value)) {
+							queue.push(d.value);
+						}
+					}
+				}
+				return true;
+			};
+			const queue: object[] = [];
+			if (!checkPlainContainer(candidate, true, queue)) return false;
 			const callerDesc = Object.getOwnPropertyDescriptor(candidate, "caller");
 			const stopDesc = Object.getOwnPropertyDescriptor(candidate, "stop");
-			if (callerDesc === undefined || !Object.hasOwn(callerDesc, "value") || typeof callerDesc.value !== "object" || callerDesc.value === null) return false;
+			if (callerDesc === undefined || !Object.hasOwn(callerDesc, "value") || typeof callerDesc.value !== "object" || callerDesc.value === null || Array.isArray(callerDesc.value)) return false;
 			if (stopDesc === undefined || !Object.hasOwn(stopDesc, "value") || typeof stopDesc.value !== "function") return false;
+			if (!checkPlainContainer(callerDesc.value, true, queue)) return false;
 			const invokeDesc = Object.getOwnPropertyDescriptor(callerDesc.value, "invoke");
-			return invokeDesc !== undefined && Object.hasOwn(invokeDesc, "value") && typeof invokeDesc.value === "function";
+			if (invokeDesc === undefined || !Object.hasOwn(invokeDesc, "value") || typeof invokeDesc.value !== "function") return false;
+			const seen = new Set<object>([candidate, callerDesc.value]);
+			while (queue.length > 0 && seen.size < 1000) {
+				const item = queue.pop() as object;
+				if (seen.has(item)) continue;
+				seen.add(item);
+				if (!checkPlainContainer(item, false, queue)) return false;
+			}
+			return true;
 		} catch (error) {
 			observePromises(error);
 			return false;

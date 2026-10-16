@@ -109,7 +109,7 @@ export function browserWorkerName(digest: string): string {
 
 /** Default monotonic clock in a browser environment using `performance.now()`. */
 export const defaultBrowserClock: HopClock = Object.freeze({
-	nowNs: () => msToNs(globalThis.performance.now()),
+	nowNs: () => BigInt(Math.round(globalThis.performance.now() * 1e6)),
 	schedule(delayMs: number, callback: () => void): HopTimer {
 		const handle = globalThis.setTimeout(callback, Math.max(0, Math.ceil(delayMs)));
 		return { cancel: () => globalThis.clearTimeout(handle) };
@@ -455,7 +455,12 @@ export function runBrowserProxy(application: BrowserProxyApplication, options: B
 	if (typeof application.buildCaller !== "function" || typeof application.callerReady !== "function") {
 		throw new TypeError("an application supplies buildCaller and callerReady");
 	}
-	const clock = options.clock ?? defaultBrowserClock;
+	const rawClock = options.clock ?? defaultBrowserClock;
+	let pinnedReceiptNs: bigint | undefined;
+	const clock: HopClock = {
+		nowNs: () => pinnedReceiptNs ?? rawClock.nowNs(),
+		schedule: (delayMs, callback) => rawClock.schedule(delayMs, callback),
+	};
 	const callClock: PinnableCallClock = callClockOf(clock);
 	// In a browser, the browser starts the worker for the first page and ends it after the last, so there is no
 	// idle timer (PX8); we pass the maximum idleMs and stop the proxy half's idle timer at once.
@@ -474,7 +479,13 @@ export function runBrowserProxy(application: BrowserProxyApplication, options: B
 			port,
 			clock,
 			{
-				message: (value) => handlers?.message(value),
+				message: (value) => {
+					try {
+						handlers?.message(value);
+					} finally {
+						pinnedReceiptNs = undefined;
+					}
+				},
 				closed: () => {
 					links.delete(link);
 					handlers?.closed();
@@ -496,10 +507,11 @@ export function runBrowserProxy(application: BrowserProxyApplication, options: B
 						: Number.NaN;
 				if (!Number.isFinite(remainingMs)) return undefined;
 				const flooredMs = Math.floor(remainingMs);
-				const nowNs = clock.nowNs();
+				// Read the worker clock once at receipt and pin that reading through proxyHalf's handOn so the
+				// call bound is floored once (`flooredMs` milliseconds from receipt, PX8).
+				const nowNs = rawClock.nowNs();
+				pinnedReceiptNs = nowNs;
 				if (flooredMs < 1) {
-					// Less than 1 whole millisecond at posting: pass a deadline < nowNs + NS_PER_MS so proxyHalf
-					// answers `not-delivered` with `proxyCode: "deadline-passed"` without invoking the caller.
 					return { ...incoming, deadline: nowNs >= NS_PER_MS ? (nowNs - NS_PER_MS).toString() : "0" };
 				}
 				const workerDeadlineNs = nowNs + msToNs(flooredMs);

@@ -1,17 +1,16 @@
 /**
  * The machine adapter (CONTRACT.md, PX1 to PX3, PX7, PX9), for Linux: the client half reaching its proxy over
  * the key's channel socket and launching the proxy when nothing answers, and the proxy as an operating-system
- * process that owns its key through an abstract-namespace socket.
+ * process that owns its key through an exclusive kernel lock on `<runtime directory>/<digest>.lock` (D57, D58).
  *
- * Owning a key (PX3): a starting proxy listens on the key's ownership socket first, which the operating system
- * lets one process hold at a time and frees the moment that process ends, `SIGKILL` included; if the address
- * is in use another proxy owns the key, and this one stops, touching nothing. Only the owner touches the
+ * Owning a key (PX3): a starting proxy acquires the exclusive kernel lock on `<digest>.lock` first, which the operating system
+ * lets one process hold at a time and frees the moment that process ends, `SIGKILL` included; if the lock
+ * is held another proxy owns the key, and this one stops, touching nothing. Only the owner touches the
  * channel socket: it removes any socket left at that path, listens there, and then builds its caller.
  *
  * Stopping (PX7): when the idle timer finds the proxy idle, and on `SIGTERM` or `SIGINT` once each call in
  * flight has ended and its ending has been sent, the proxy stops accepting connections, closes those not
- * welcomed and then the rest, closes and removes the channel socket, stops its caller, and stops listening on
- * the ownership socket last, so the next owner can take the key only after the last step. A start that fails
+ * welcomed and then the rest, closes and removes the channel socket, stops its caller, and releases the ownership lock last, so the next owner can take the key only after the last step. A start that fails
  * after taking ownership - an observer throwing at `owned` or `listening`, or a clock reading failing, included -
  * stops its idle timer and closes what it opened, its connections, the channel's server and then ownership, before
  * its failure is given, so a later start in this process owns the key.
@@ -125,6 +124,15 @@ export function createMachineClientIn(dir: string, application: MachineClientApp
 				let socketPath: string;
 				try {
 					ensureRuntime(dir);
+					const lockPath = ownershipPath(dir, digest);
+					let hasLockEntry = false;
+					try {
+						fs.lstatSync(lockPath);
+						hasLockEntry = true;
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new RuntimeUnsafe("unusable", `the ownership lock ${lockPath} cannot be examined`, { cause: error });
+					}
+					if (hasLockEntry) ensureLockFile(lockPath);
 					socketPath = channelPath(dir, digest);
 				} catch (error) {
 					if (error instanceof RuntimeUnsafe) return { kind: "unsafe" };

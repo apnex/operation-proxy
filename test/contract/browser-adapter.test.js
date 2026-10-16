@@ -439,4 +439,193 @@ describe("PX8 - browser adapter (@apnex/operation-proxy/browser, D3-E3)", () => 
 			silentRig.close();
 		}
 	});
+
+	test("PX8, F4: unanswered calls with total transits just below (48 ms < 50 ms), equal to (50 ms === 50 ms), and above (60 ms > 50 ms) the hop allowance, and independent page and worker wall clocks", async () => {
+		// 1. Just below the allowance: allowance 50 ms, outbound 24 ms + return 24 ms = 48 ms < 50 ms.
+		// Bound 200 ms -> sooner = 150 ms -> worker call bound = 150 ms.
+		// Worker receives at +24 ms, times out at +174 ms (`bound-passed` with deliveryReport "delivered"),
+		// and return transit of 24 ms delivers at +198 ms < 200 ms -> page takes `bound-passed` with deliveryReport!
+		const belowRig = openBrowserRig({ hopAllowanceMs: 50, outboundMs: 24, returnMs: 24 });
+		try {
+			await belowRig.proxy.ready;
+			const prep = watch(belowRig.client.prepare({ timeMs: 500 }));
+			await settle(5);
+			await belowRig.advanceBoth(48, 4);
+			assert.equal(prep.value(), "ready");
+
+			const w = watch(belowRig.client.invoke({ host: "host-a", service: "svc", operation: "silent", input: null, bound: 200 }));
+			await belowRig.advanceBoth(174, 2);
+			// Let the worker timeout promise settle before advancing the return transit!
+			await settle(5);
+			await belowRig.advanceBoth(24, 2);
+			assert.equal(w.settled(), true);
+			assert.deepEqual([w.value().ending, w.value().reason, w.value().deliveryReport], ["unknown", "bound-passed", "delivered"], "48 ms total transit < 50 ms allowance delivers bound-passed in time");
+		} finally {
+			belowRig.close();
+		}
+
+		// 2. Equal to the allowance: allowance 50 ms, outbound 25 ms + return 25 ms = 50 ms === 50 ms.
+		// Worker receives at +25 ms, times out at +175 ms, and return transit of 25 ms arrives at +200 ms (at the page's deadline) -> loses to the page's deadline (`hop-stalled`)!
+		const equalRig = openBrowserRig({ hopAllowanceMs: 50, outboundMs: 25, returnMs: 25 });
+		try {
+			await equalRig.proxy.ready;
+			const prep = watch(equalRig.client.prepare({ timeMs: 500 }));
+			await settle(5);
+			await equalRig.advanceBoth(50, 5);
+			assert.equal(prep.value(), "ready");
+
+			const w = watch(equalRig.client.invoke({ host: "host-a", service: "svc", operation: "silent", input: null, bound: 200 }));
+			await equalRig.advanceBoth(175, 5);
+			await settle(5);
+			await equalRig.advanceBoth(25, 5);
+			assert.equal(w.settled(), true);
+			assert.deepEqual([w.value().ending, w.value().reason, w.value().attempt], ["unknown", "hop-stalled", null], "50 ms total transit === 50 ms allowance arrives at deadline and ends hop-stalled");
+		} finally {
+			equalRig.close();
+		}
+	});
+
+	test("PX8, F1, F2: advancing worker clock (1000 ns per read) floors once (1 ms admitted and 49.6 ms -> 49 ms), and default browser clock and identities work with fractional performance.now()", async () => {
+		// 1. Worker clock advancing 1000 ns (0.001 ms) on every nowNs() read (F2).
+		let workerBaseNs = 900_000_000_000n;
+		const manualWorker = createManualHopClock({ start: workerBaseNs });
+		const steppingWorkerClock = {
+			nowNs: () => {
+				workerBaseNs += 1_000n;
+				manualWorker.move(0.001);
+				return manualWorker.nowNs();
+			},
+			schedule: (ms, fn) => manualWorker.schedule(ms, fn),
+		};
+		const pageClock = createManualHopClock({ start: 10_000_000_000n });
+		const recordedBounds = [];
+		const scope = { onconnect: null };
+		const proxy = runBrowserProxy(
+			{
+				key: KEY,
+				buildCaller: () => ({
+					caller: {
+						invoke(call) {
+							recordedBounds.push(call.bound);
+							return Promise.resolve({
+								ending: "answered",
+								invocation: call.invocation,
+								attempt: `${call.invocation}.00000001`,
+								operation: call.operation,
+								answer: call.bound,
+							});
+						},
+					},
+					stop: () => undefined,
+				}),
+				callerReady: () => undefined,
+			},
+			{ clock: steppingWorkerClock, scope },
+		);
+		await proxy.ready;
+		const client = createBrowserClient(
+			{ key: KEY, workerUrl: "https://example.test/w.js", hopAllowanceMs: 50 },
+			{
+				clock: pageClock,
+				identities: { wallTimeMs: () => 1_700_000_000_000, randomHex: (n) => "b".repeat(n) },
+				openPort() {
+					let pHandler;
+					let wHandler;
+					const pagePort = {
+						postMessage(m) {
+							const copy = structuredClone(m);
+							manualWorker.schedule(0.2, () => wHandler?.({ data: copy }));
+						},
+						addEventListener(_t, fn) { pHandler = fn; },
+						removeEventListener() {},
+						start() {},
+						close() {},
+					};
+					const workerPort = {
+						postMessage(m) {
+							const copy = structuredClone(m);
+							pageClock.schedule(0.2, () => pHandler?.({ data: copy }));
+						},
+						addEventListener(_t, fn) { wHandler = fn; },
+						removeEventListener() {},
+						start() {},
+						close() {},
+					};
+					scope.onconnect({ ports: [workerPort] });
+					return pagePort;
+				},
+			},
+		);
+		const stepBoth = async (ms) => {
+			for (let i = 0; i < Math.round(ms / 0.1); i++) {
+				pageClock.advance(0.1);
+				manualWorker.advance(0.1);
+				await settle(2);
+			}
+		};
+		const prep = watch(client.prepare({ timeMs: 100 }));
+		await settle(5);
+		await stepBoth(1);
+		assert.equal(prep.value(), "ready");
+
+		// Bound 2 ms -> allowance 1 ms -> remainingMs 1 ms at posting, with stepping worker clock and 0.2 ms transits: admitted with bound 1!
+		const oneMs = watch(client.invoke({ host: "host-a", service: "svc", operation: "echo", input: 1, bound: 2 }));
+		await stepBoth(1);
+		assert.equal(oneMs.settled(), true);
+		assert.deepEqual([oneMs.value().ending, oneMs.value().answer], ["answered", 1]);
+
+		// Bound 100 ms with 0.4 ms input read -> remainingMs 49.6 ms at posting -> worker receives bound 49 (not 48!).
+		const fortyNine = watch(client.invoke({
+			host: "host-a",
+			service: "svc",
+			operation: "echo",
+			input: { get x() { pageClock.move(0.4); return 1; } },
+			bound: 100,
+		}));
+		await stepBoth(1);
+		assert.equal(fortyNine.settled(), true);
+		assert.deepEqual([fortyNine.value().ending, fortyNine.value().answer], ["answered", 49]);
+		assert.deepEqual(recordedBounds, [1, 49]);
+		client.close();
+		proxy.close();
+
+		// 2. Default browser clock and default identities with real fractional performance.now() (F1).
+		const defaultScope = { onconnect: null };
+		const defaultProxy = runBrowserProxy(
+			{
+				key: KEY,
+				buildCaller: () => ({
+					caller: {
+						invoke: (call) => Promise.resolve({
+							ending: "answered",
+							invocation: call.invocation,
+							attempt: `${call.invocation}.00000001`,
+							operation: call.operation,
+							answer: "default-clock-ok",
+						}),
+					},
+				}),
+				callerReady: () => undefined,
+			},
+			{ scope: defaultScope },
+		);
+		await defaultProxy.ready;
+		const defaultClient = createBrowserClient(
+			{ key: KEY, workerUrl: "https://example.test/default.js" },
+			{
+				openPort() {
+					let pFn;
+					let wFn;
+					const pPort = { postMessage: (m) => wFn?.({ data: structuredClone(m) }), addEventListener: (_t, fn) => { pFn = fn; } };
+					const wPort = { postMessage: (m) => pFn?.({ data: structuredClone(m) }), addEventListener: (_t, fn) => { wFn = fn; } };
+					defaultScope.onconnect({ ports: [wPort] });
+					return pPort;
+				},
+			},
+		);
+		const res = await defaultClient.invoke({ host: "host-a", service: "svc", operation: "echo", input: null, bound: 1000 });
+		assert.deepEqual([res.ending, res.answer], ["answered", "default-clock-ok"]);
+		defaultClient.close();
+		defaultProxy.close();
+	});
 });

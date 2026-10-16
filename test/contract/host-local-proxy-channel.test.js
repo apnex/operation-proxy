@@ -305,7 +305,7 @@ async function lockHeld(lockPath) {
 	}
 }
 
-test("D3-E2, PX2, PX3: a symbolic link at <digest>.lock is refused as runtime-dir-unsafe", async () => {
+test("D3-E2, PX2, PX3: a symbolic link at <digest>.lock is refused as runtime-dir-unsafe by both startMachineProxyIn and createMachineClientIn", async () => {
 	const dir = path.join(temp(), "rt");
 	ensureRuntime(dir);
 	const lockPath = path.join(dir, `${keyDigest(KEY)}.lock`);
@@ -317,6 +317,15 @@ test("D3-E2, PX2, PX3: a symbolic link at <digest>.lock is refused as runtime-di
 		() => startMachineProxyIn(dir, { key: KEY, idleMs: 60_000, buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }), callerReady: () => undefined }),
 		(err) => err instanceof RuntimeUnsafe && err.reason === "unusable",
 	);
+	const client = createMachineClientIn(dir, { key: KEY, launch: { command: process.execPath, args: ["-e", ""] } });
+	try {
+		const prep = await client.prepare({ timeMs: 1000 });
+		assert.deepEqual(prep, { ending: "not-delivered", invocation: null, attempt: null, operation: null, agpCode: null, proxyCode: "runtime-dir-unsafe", earlierAttemptsUncertain: false });
+		const inv = await client.invoke({ host: "host-a", service: "svc", operation: "echo", input: null, bound: 1000 });
+		assert.deepEqual([inv.ending, inv.proxyCode], ["not-delivered", "runtime-dir-unsafe"]);
+	} finally {
+		client.close();
+	}
 });
 
 test("D3-E2, PX2, PX3: a running proxy holds <digest>.lock inside the mode-0700 runtime directory with nothing in /proc/net/unix; held by a process that is no proxy once the proxy stops, a client writes no invocation and ends once, at its connect deadline, not-delivered with proxy-unreachable; released, the next command starts a proxy", { timeout: 180_000 }, async () => {

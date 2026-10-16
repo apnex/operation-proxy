@@ -2,7 +2,7 @@
 
 Let short-lived processes invoke named operations through one long-lived caller they share, each invocation still ending honestly.
 
-**Status: built, and certified at zorg's Delta 1, stage 4a, at `1d3d127`.**\
+**Status: built, and certified at zorg's Delta 1, stage 4a (`1d3d127`), and Delta 2, stage 4 (`cedb52f` / `73fdd3a`).**\
 Its vision is ratified (zorg's `D50`), and its contract's design is certified at zorg's Delta 1, stage 0.\
 Its contract tests run operation-call's caller suite through the client half, and the proxy's own cases over real Unix domain sockets, abstract-namespace sockets and child processes, so they run on Linux only.\
 `npm test` also compiles `test/types/caller-interface-parity.ts`, a strict consumer of operation-call's caller interface, which passes when it compiles: it accepts operation-call's caller and the client half unchanged (zorg's `EM12`).
@@ -13,7 +13,7 @@ Its contract tests run operation-call's caller suite through the client half, an
 
 It belongs to a component set first composed by zorg (`apnex/zorg`), and is private until its first working code.
 
-It depends on `@apnex/operation-call` through a `file:` link to a checkout beside it, and its tests on `@agp/core`, `@agp/node` and `@agp/transport-loopback` the same way.\
+It depends on `@apnex/operation-call` and `@apnex/shape-check` through `file:` links to checkouts beside it, and its tests on `@agp/core`, `@agp/node` and `@agp/transport-loopback` the same way.\
 Each checkout must be installed and built first, since no `dist/` is committed.\
 The tests create `.operation-proxy` in the home directory the user database records, as every proxy of the user does, and leave its `secret` there.
 

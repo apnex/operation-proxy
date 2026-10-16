@@ -471,6 +471,10 @@ describe("PX8 - browser adapter (@apnex/operation-proxy/browser, D3-E3)", () => 
 		const wallRig = openBrowserRig({ hopAllowanceMs: 50, outboundMs: 10, returnMs: 10 });
 		try {
 			await wallRig.proxy.ready;
+			const prep = watch(wallRig.client.prepare({ timeMs: 500 }));
+			await settle(5);
+			await wallRig.advanceBoth(20, 2);
+			assert.equal(prep.value(), "ready");
 			Date.now = () => pageWallMs;
 			const wallCall = watch(wallRig.client.invoke({ host: "host-a", service: "svc", operation: "echo", input: "wall", bound: 200 }));
 			await settle(5);

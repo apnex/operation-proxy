@@ -296,10 +296,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value")) return false;
 					if (d.value instanceof Promise) return false;
 					if (d.value !== null && typeof d.value === "object") {
-						const childProto = Object.getPrototypeOf(d.value);
-						if (d.value instanceof Promise || childProto === Object.prototype || childProto === null || Array.isArray(d.value)) {
-							queue.push(d.value);
-						}
+						queue.push(d.value);
 					}
 				}
 				return true;

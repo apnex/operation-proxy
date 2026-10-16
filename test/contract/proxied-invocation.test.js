@@ -1378,6 +1378,14 @@ test("D2-E4, PX4, PX5, PX6, PX9, D54, D55: src/call-checks.ts is removed; CallRe
 					callerReady: () => undefined,
 				},
 				{
+					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: new (class Extra { p = Promise.reject(new Error("nested-build-class-extra")); })() }),
+					callerReady: () => undefined,
+				},
+				{
+					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined, extra: new (class Extra { x = 1; })() }),
+					callerReady: () => undefined,
+				},
+				{
 					buildCaller: () => ({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }),
 					callerReady: () => ({ then(resolve) { getters++; resolve(undefined); }, p: Promise.reject(new Error("callerReady thenable promise")) }),
 				},

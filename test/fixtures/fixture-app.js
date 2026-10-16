@@ -99,8 +99,11 @@ export function fixtureProxyApplication(config) {
 			return {
 				caller,
 				nodeId,
-				host,
-				proxyNode,
+				isReady() {
+					const routes = proxyNode.operations.routes().candidates;
+					const acked = proxyNode.operations.routeExports().items.some((r) => r.endpoint === REPLY && r.remoteNodeId === "host-a" && r.state === "acked");
+					return acked && SERVICES.every((s) => OPERATIONS.every((o) => routes.some((r) => r.endpoint === `${s}/${o}` && r.originNodeId === "host-a")));
+				},
 				async stop() {
 					record(path.join(config.records, "caller-stopped.ndjson"), { pid: process.pid });
 					await caller.close();
@@ -111,11 +114,7 @@ export function fixtureProxyApplication(config) {
 		},
 		async callerReady(built) {
 			// Ready once every fixture endpoint is routed to the proxy's node and its reply endpoint is acknowledged.
-			const ready = () => {
-				const routes = built.proxyNode.operations.routes().candidates;
-				const acked = built.proxyNode.operations.routeExports().items.some((r) => r.endpoint === REPLY && r.remoteNodeId === "host-a" && r.state === "acked");
-				return acked && SERVICES.every((s) => OPERATIONS.every((o) => routes.some((r) => r.endpoint === `${s}/${o}` && r.originNodeId === "host-a")));
-			};
+			const ready = () => built.isReady();
 			if (config.readyAfterFile) while (!fs.existsSync(config.readyAfterFile)) await new Promise((r) => setTimeout(r, 20));
 			while (!ready()) await new Promise((r) => setTimeout(r, 5));
 			record(path.join(config.records, "ready.ndjson"), { pid: process.pid, node: built.nodeId });

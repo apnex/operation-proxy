@@ -2,8 +2,7 @@
 //
 // Every path in package.json's exports is named in the map; each module path is imported by its public name
 // and its runtime exports compared with the map; every capability row of CONTRACT.md is served by some export,
-// none is deferred, since zorg's Delta 1 fences all six; the one deferred entry is the browser adapter of PX8,
-// declared and not built. The client half and the proxy half run in clients - a short-lived process, a browser's
+// none is deferred: zorg's Delta 1 and Delta 3 (D57) build all six rows and both the machine and browser adapters. The client half and the proxy half run in clients - a short-lived process, a browser's
 // shared worker - so no source file imports a module particular to one runtime, or uses a global particular to
 // Node, outside a file whose name ends -adapter.ts (zorg's principle 6, D31); AGP reaches the source as types
 // only; and only the machine's clock adapter and its runtime adapter read a clock or randomness. Needs no socket.

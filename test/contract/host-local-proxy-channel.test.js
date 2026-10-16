@@ -6,7 +6,7 @@
 // fresh temporary directory; the case of commands run with different HOME, TMPDIR and XDG_RUNTIME_DIR uses
 // the user's own runtime directory, `.operation-proxy` in the home directory the user database records, which
 // it creates if absent and leaves with its secret, as every later process of the user agrees on it. The case
-// of a held ownership name reads /proc/net/unix, and fails, never skips, where it cannot (zorg's D53).
+// of a held ownership lock uses <digest>.lock inside the private runtime directory (zorg's D57, D58).
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -243,7 +243,7 @@ test("a first-ever client whose complete secret is written after another's is li
 	assert.deepEqual(fs.readdirSync(dir), ["secret"], "the slow client removed its own file");
 });
 
-test("the proxy listens on no network port: its sockets are its Unix channel socket and its abstract-namespace ownership socket", { timeout: 60_000 }, async () => {
+test("the proxy listens on no network port: its socket is its Unix channel socket and its ownership lock is <digest>.lock in the runtime directory", { timeout: 60_000 }, async () => {
 	const f = fixture();
 	fixtures.push(f);
 	const pid = (await f.client({ operation: "which" }).ack()).ending.answer.pid;

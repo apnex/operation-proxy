@@ -2,7 +2,7 @@
 // with nothing set up beforehand: processes that start at once end with one proxy, and a proxy left behind by
 // a crash is replaced (CONTRACT.md, PX3; zorg's E17).
 //
-// Needs Unix sockets, abstract-namespace sockets and child processes: the fixture application's short-lived
+// Needs Unix sockets, private-directory ownership locks (<digest>.lock) and child processes: the fixture application's short-lived
 // clients and its proxies are real processes, each with a runtime directory of its own. The launch cadence,
 // which needs no socket, is checked on an injected clock in test/unit/client-preparing.test.js.
 import assert from "node:assert/strict";

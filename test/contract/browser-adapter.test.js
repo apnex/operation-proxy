@@ -352,8 +352,7 @@ describe("PX8 - browser adapter (@apnex/operation-proxy/browser, D3-E3)", () => 
 				input: { x: 2 },
 				bound: 2,
 			}));
-			// Wait: with bound 2 ms and outboundMs 5 ms, the page's 2 ms deadline passes at +2 ms (`hop-stalled`),
-			// and at +5 ms the worker receives the message with remainingMs = 1 and admits it (`rig.calls.length === 1`)!
+			// With bound 2 ms and outboundMs 0.4 ms, returnMs 0.4 ms, the worker receives remainingMs = 1, admits it, and answers before the 2 ms deadline.
 			await rig.advanceBoth(0.5, 0.1);
 			assert.equal(rig.calls.length, 1, "worker admitted remainingMs === 1 despite positive outbound transit");
 			assert.equal(rig.calls[0].bound, 1);
@@ -462,6 +461,34 @@ describe("PX8 - browser adapter (@apnex/operation-proxy/browser, D3-E3)", () => 
 			assert.deepEqual([w.value().ending, w.value().reason, w.value().deliveryReport], ["unknown", "bound-passed", "delivered"], "48 ms total transit < 50 ms allowance delivers bound-passed in time");
 		} finally {
 			belowRig.close();
+		}
+
+		// 1b. Independent page and worker wall clocks stepped in opposite directions (+3_600_000 ms on page, -3_600_000 ms on worker) while a call is in flight:
+		// monotonic deadline calculation on each side is unaffected, and the page's invocation identity uses the page's wall clock.
+		let pageWallMs = 1_800_000_000_000;
+		let workerWallMs = 1_600_000_000_000;
+		const origDateNow = Date.now;
+		const wallRig = openBrowserRig({ hopAllowanceMs: 50, outboundMs: 10, returnMs: 10 });
+		try {
+			await wallRig.proxy.ready;
+			Date.now = () => pageWallMs;
+			const wallCall = watch(wallRig.client.invoke({ host: "host-a", service: "svc", operation: "echo", input: "wall", bound: 200 }));
+			await settle(5);
+			// Step page wall clock forward 1 hour and worker wall clock backward 1 hour while the call is in transit.
+			pageWallMs += 3_600_000;
+			workerWallMs -= 3_600_000;
+			Date.now = () => workerWallMs;
+			await wallRig.advanceBoth(10, 2);
+			assert.equal(wallRig.calls.length, 1);
+			assert.equal(wallRig.calls[0].bound, 150, "worker bound unaffected by opposite wall-clock shifts");
+			wallRig.calls[0].answer("wall-ok");
+			await settle(5);
+			await wallRig.advanceBoth(10, 2);
+			assert.equal(wallCall.settled(), true);
+			assert.deepEqual([wallCall.value().ending, wallCall.value().answer], ["answered", "wall-ok"]);
+		} finally {
+			Date.now = origDateNow;
+			wallRig.close();
 		}
 
 		// 2. Equal to the allowance: allowance 50 ms, outbound 25 ms + return 25 ms = 50 ms === 50 ms.

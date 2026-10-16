@@ -272,7 +272,16 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	const validBuiltCaller = (candidate: unknown): candidate is ProxiedCaller => {
 		if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
 		try {
-			const checkPlainContainer = (obj: object, forbidThen: boolean, queue: object[]): boolean => {
+			const validValue = (val: unknown, queue: Frame[]): boolean => {
+				if (val === null || typeof val === "boolean" || typeof val === "string" || typeof val === "function") return true;
+				if (typeof val === "number") return Number.isFinite(val);
+				if (typeof val !== "object") return false;
+				if (val instanceof Promise) return false;
+				queue.push({ obj: val, forbidThen: false, enter: true });
+				return true;
+			};
+			interface Frame { readonly obj: object; readonly forbidThen: boolean; readonly enter: boolean }
+			const readChildren = (obj: object, forbidThen: boolean, queue: Frame[]): boolean => {
 				if (obj instanceof Promise) return false;
 				if (Object.getOwnPropertySymbols(obj).length > 0) return false;
 				const proto = Object.getPrototypeOf(obj);
@@ -280,12 +289,10 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 					if (proto !== Array.prototype) return false;
 					const names = Object.getOwnPropertyNames(obj);
 					const lenDesc = Object.getOwnPropertyDescriptor(obj, "length");
-					if (lenDesc === undefined || !Object.hasOwn(lenDesc, "value") || typeof lenDesc.value !== "number" || names.length !== lenDesc.value + 1) return false;
+					if (lenDesc === undefined || !Object.hasOwn(lenDesc, "value") || typeof lenDesc.value !== "number" || !Number.isInteger(lenDesc.value) || lenDesc.value < 0 || names.length !== lenDesc.value + 1) return false;
 					for (let i = 0; i < lenDesc.value; i++) {
 						const d = Object.getOwnPropertyDescriptor(obj, String(i));
-						if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value")) return false;
-						if (d.value instanceof Promise) return false;
-						if (d.value !== null && typeof d.value === "object") queue.push(d.value);
+						if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value") || !validValue(d.value, queue)) return false;
 					}
 					return true;
 				}
@@ -293,29 +300,34 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 				for (const name of Object.getOwnPropertyNames(obj)) {
 					if (forbidThen && name === "then") return false;
 					const d = Object.getOwnPropertyDescriptor(obj, name);
-					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value")) return false;
-					if (d.value instanceof Promise) return false;
-					if (d.value !== null && typeof d.value === "object") {
-						queue.push(d.value);
-					}
+					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value") || !validValue(d.value, queue)) return false;
 				}
 				return true;
 			};
-			const queue: object[] = [];
-			if (!checkPlainContainer(candidate, true, queue)) return false;
 			const callerDesc = Object.getOwnPropertyDescriptor(candidate, "caller");
 			const stopDesc = Object.getOwnPropertyDescriptor(candidate, "stop");
-			if (callerDesc === undefined || !Object.hasOwn(callerDesc, "value") || typeof callerDesc.value !== "object" || callerDesc.value === null || Array.isArray(callerDesc.value)) return false;
-			if (stopDesc === undefined || !Object.hasOwn(stopDesc, "value") || typeof stopDesc.value !== "function") return false;
-			if (!checkPlainContainer(callerDesc.value, true, queue)) return false;
+			if (callerDesc === undefined || callerDesc.enumerable !== true || !Object.hasOwn(callerDesc, "value") || typeof callerDesc.value !== "object" || callerDesc.value === null || Array.isArray(callerDesc.value)) return false;
+			if (stopDesc === undefined || stopDesc.enumerable !== true || !Object.hasOwn(stopDesc, "value") || typeof stopDesc.value !== "function") return false;
 			const invokeDesc = Object.getOwnPropertyDescriptor(callerDesc.value, "invoke");
-			if (invokeDesc === undefined || !Object.hasOwn(invokeDesc, "value") || typeof invokeDesc.value !== "function") return false;
-			const seen = new Set<object>([candidate, callerDesc.value]);
-			while (queue.length > 0 && seen.size < 1000) {
-				const item = queue.pop() as object;
-				if (seen.has(item)) continue;
-				seen.add(item);
-				if (!checkPlainContainer(item, false, queue)) return false;
+			if (invokeDesc === undefined || invokeDesc.enumerable !== true || !Object.hasOwn(invokeDesc, "value") || typeof invokeDesc.value !== "function") return false;
+			const queue: Frame[] = [];
+			if (!readChildren(candidate, true, queue) || !readChildren(callerDesc.value, true, queue)) return false;
+			const open = new Set<object>([candidate, callerDesc.value]);
+			if (open.size !== 2) return false;
+			const done = new Set<object>();
+			while (queue.length > 0) {
+				const frame = queue.pop() as Frame;
+				if (!frame.enter) {
+					open.delete(frame.obj);
+					done.add(frame.obj);
+					continue;
+				}
+				if (done.has(frame.obj)) continue;
+				if (open.has(frame.obj)) return false;
+				if (frame.obj === callerDesc.value) continue;
+				open.add(frame.obj);
+				queue.push({ obj: frame.obj, forbidThen: frame.forbidThen, enter: false });
+				if (!readChildren(frame.obj, frame.forbidThen, queue)) return false;
 			}
 			return true;
 		} catch (error) {

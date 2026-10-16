@@ -269,6 +269,12 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	 * promises, `caller.invoke` and `stop` are functions, and any plain object or array reachable from the
 	 * record's own properties holds only own enumerable data descriptors with no symbols, getters or promises.
 	 */
+	/**
+	 * Reads and copies a settled `buildCaller` result through its own enumerable data descriptors only (PX9;
+	 * D54, D55), returning a fresh deeply frozen plain record whose `caller` and `stop` come from those
+	 * descriptor reads, so no `Proxy` `get` trap or target getter ever runs when the record is returned from
+	 * `building`, passed to `callerReady`, or used by `ready` and `stop`.
+	 */
 	const validateBuiltCaller = (candidate: unknown): ProxiedCaller | undefined => {
 		const captured: unknown[] = [candidate];
 		const fail = (): undefined => {
@@ -282,70 +288,102 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 			return d;
 		};
 		try {
-			interface Frame { readonly obj: object; readonly forbidThen: boolean; readonly enter: boolean }
-			const validValue = (val: unknown, forbidThen: boolean, queue: Frame[]): boolean => {
-				if (val === null || typeof val === "boolean" || typeof val === "string" || typeof val === "function") return true;
-				if (typeof val === "number") return Number.isFinite(val);
-				if (typeof val !== "object") return false;
-				if (val instanceof Promise) return false;
-				queue.push({ obj: val, forbidThen, enter: true });
-				return true;
-			};
-			let callerObj: object | undefined;
-			let stopFn: (() => Promise<void> | void) | undefined;
-			let invokeFn: CallLayerCaller["invoke"] | undefined;
-			const readChildren = (obj: object, forbidThen: boolean, queue: Frame[]): boolean => {
-				if (obj instanceof Promise) return false;
-				if (Object.getOwnPropertySymbols(obj).length > 0) return false;
+			interface Frame {
+				readonly source: object;
+				readonly copy: unknown[] | { [name: string]: unknown };
+				readonly keys: readonly string[];
+				readonly values: readonly unknown[];
+				readonly forbidThen: boolean;
+				next: number;
+				readonly place: (finished: object) => void;
+			}
+			const readMembers = (obj: object, forbidThen: boolean): { readonly array: boolean; readonly keys: readonly string[]; readonly values: readonly unknown[] } | undefined => {
+				if (obj instanceof Promise) return undefined;
+				if (Object.getOwnPropertySymbols(obj).length > 0) return undefined;
 				const proto = Object.getPrototypeOf(obj);
+				const names = Object.getOwnPropertyNames(obj);
 				if (Array.isArray(obj)) {
-					if (proto !== Array.prototype) return false;
-					const names = Object.getOwnPropertyNames(obj);
+					if (proto !== Array.prototype) return undefined;
 					const lenDesc = readDesc(obj, "length");
-					if (lenDesc === undefined || !Object.hasOwn(lenDesc, "value") || typeof lenDesc.value !== "number" || !Number.isInteger(lenDesc.value) || lenDesc.value < 0 || names.length !== lenDesc.value + 1) return false;
+					if (lenDesc === undefined || !Object.hasOwn(lenDesc, "value") || typeof lenDesc.value !== "number" || !Number.isInteger(lenDesc.value) || lenDesc.value < 0 || names.length !== lenDesc.value + 1) return undefined;
+					const keys: string[] = [];
+					const values: unknown[] = [];
 					for (let i = 0; i < lenDesc.value; i++) {
-						const d = readDesc(obj, String(i));
-						if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value") || !validValue(d.value, false, queue)) return false;
+						const key = String(i);
+						const d = readDesc(obj, key);
+						if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value")) return undefined;
+						keys.push(key);
+						values.push(d.value);
 					}
+					return { array: true, keys, values };
+				}
+				if (proto !== Object.prototype && proto !== null) return undefined;
+				const values: unknown[] = [];
+				for (const name of names) {
+					if (forbidThen && name === "then") return undefined;
+					const d = readDesc(obj, name);
+					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value")) return undefined;
+					values.push(d.value);
+				}
+				return { array: false, keys: names, values };
+			};
+			let rootCopy: { [name: string]: unknown } | undefined;
+			const frames: Frame[] = [];
+			const open = new Set<object>();
+			const done = new Map<object, object>();
+			const define = (target: object, key: string, value: unknown): void => {
+				Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+			};
+			const take = (item: unknown, forbidThen: boolean, place: (value: unknown) => void): boolean => {
+				if (item === null || typeof item === "boolean" || typeof item === "string" || typeof item === "function") {
+					place(item);
 					return true;
 				}
-				if (proto !== Object.prototype && proto !== null) return false;
-				for (const name of Object.getOwnPropertyNames(obj)) {
-					if (forbidThen && name === "then") return false;
-					const d = readDesc(obj, name);
-					if (d === undefined || d.enumerable !== true || !Object.hasOwn(d, "value")) return false;
-					if (obj === candidate && name === "caller") {
-						if (typeof d.value !== "object" || d.value === null || Array.isArray(d.value)) return false;
-						callerObj = d.value;
-					} else if (obj === candidate && name === "stop") {
-						if (typeof d.value !== "function") return false;
-						stopFn = d.value as () => Promise<void> | void;
-					} else if (obj === callerObj && name === "invoke") {
-						if (typeof d.value !== "function") return false;
-						invokeFn = d.value as CallLayerCaller["invoke"];
-					}
-					if (!validValue(d.value, obj === candidate && name === "caller", queue)) return false;
+				if (typeof item === "number") {
+					if (!Number.isFinite(item)) return false;
+					place(item === 0 ? 0 : item);
+					return true;
 				}
+				if (typeof item !== "object") return false;
+				if (item instanceof Promise) return false;
+				const existing = done.get(item);
+				if (existing !== undefined) {
+					place(existing);
+					return true;
+				}
+				if (open.has(item)) return false;
+				const members = readMembers(item, forbidThen);
+				if (members === undefined) return false;
+				const copy = members.array ? new Array<unknown>(members.keys.length) : {};
+				open.add(item);
+				frames.push({ source: item, copy, keys: members.keys, values: members.values, forbidThen, next: 0, place });
 				return true;
 			};
-			const queue: Frame[] = [{ obj: candidate, forbidThen: true, enter: true }];
-			const open = new Set<object>();
-			const done = new Set<object>();
-			while (queue.length > 0) {
-				const frame = queue.pop() as Frame;
-				if (!frame.enter) {
-					open.delete(frame.obj);
-					done.add(frame.obj);
+			if (!take(candidate, true, (v) => { rootCopy = v as { [name: string]: unknown }; })) return fail();
+			while (frames.length > 0) {
+				const frame = frames.at(-1) as Frame;
+				if (frame.next < frame.keys.length) {
+					const i = frame.next++;
+					const key = frame.keys[i] as string;
+					const val = frame.values[i];
+					const childForbidThen = frame.source === candidate && key === "caller";
+					if (childForbidThen && (val === null || typeof val !== "object" || Array.isArray(val))) return fail();
+					if (!take(val, childForbidThen, (copied) => define(frame.copy, key, copied))) return fail();
 					continue;
 				}
-				if (done.has(frame.obj)) continue;
-				if (open.has(frame.obj)) return fail();
-				open.add(frame.obj);
-				queue.push({ obj: frame.obj, forbidThen: frame.forbidThen, enter: false });
-				if (!readChildren(frame.obj, frame.forbidThen, queue)) return fail();
+				frames.pop();
+				Object.freeze(frame.copy);
+				open.delete(frame.source);
+				done.set(frame.source, frame.copy);
+				frame.place(frame.copy);
 			}
-			if (callerObj === undefined || stopFn === undefined || invokeFn === undefined) return fail();
-			return candidate as ProxiedCaller;
+			if (rootCopy === undefined) return fail();
+			const callerVal = rootCopy.caller;
+			const stopVal = rootCopy.stop;
+			if (callerVal === null || typeof callerVal !== "object" || Array.isArray(callerVal) || typeof stopVal !== "function") return fail();
+			const invokeVal = (callerVal as { readonly invoke?: unknown }).invoke;
+			if (typeof invokeVal !== "function") return fail();
+			return rootCopy as unknown as ProxiedCaller;
 		} catch (error) {
 			captured.push(error);
 			return fail();

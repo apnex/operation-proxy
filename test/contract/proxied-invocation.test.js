@@ -1377,6 +1377,47 @@ test("D2-E4, PX4, PX5, PX6, PX9, D54, D55: src/call-checks.ts is removed; CallRe
 				assert.deepEqual([readyCalls, stopCalls], [1, 1], `positive ${i} callbacks ran`);
 			}
 
+			// Proxy get traps on a valid descriptor-only buildCaller record are never invoked (for then, caller or stop).
+			for (const [i, makeBuilt] of [
+				() => {
+					const target = { stop: () => undefined };
+					Object.defineProperty(target, "caller", { configurable: true, enumerable: true, get() { getters++; return { invoke: () => Promise.resolve() }; } });
+					return new Proxy(target, {
+						getOwnPropertyDescriptor(t, prop) {
+							if (prop === "caller") return { configurable: true, enumerable: true, writable: true, value: { invoke: () => Promise.resolve() } };
+							return Reflect.getOwnPropertyDescriptor(t, prop);
+						},
+					});
+				},
+				() => {
+					const target = { caller: { invoke: () => Promise.resolve() } };
+					Object.defineProperty(target, "stop", { configurable: true, enumerable: true, get() { getters++; return () => undefined; } });
+					return new Proxy(target, {
+						getOwnPropertyDescriptor(t, prop) {
+							if (prop === "stop") return { configurable: true, enumerable: true, writable: true, value: () => undefined };
+							return Reflect.getOwnPropertyDescriptor(t, prop);
+						},
+					});
+				},
+				() => new Proxy({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }, {
+					get(t, prop, r) {
+						if (prop === "then") { getters++; return (resolve) => resolve({ caller: { invoke: () => Promise.resolve() }, stop: () => undefined }); }
+						return Reflect.get(t, prop, r);
+					},
+				}),
+			].entries()) {
+				let onReady;
+				const readyPromise = new Promise((r) => { onReady = r; });
+				const proxy = await startMachineProxyIn(
+					dir,
+					{ key: KEY, idleMs: 60_000, buildCaller: makeBuilt, callerReady: () => undefined },
+					{ observe: (stage) => { if (stage === "ready") onReady(); } },
+				);
+				await readyPromise;
+				proxy.stop();
+				assert.equal(await proxy.stopped, 0, `proxy descriptor-only case ${i}`);
+			}
+
 			// Malformed buildCaller cases: never reach "built" or call callerReady, and stop with status 1.
 			const buildCases = [
 				() => ({ get caller() { getters++; return { invoke: () => Promise.resolve() }; }, stop: () => undefined, p: Promise.reject(new Error("buildCaller getter promise")) }),

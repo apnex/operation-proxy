@@ -180,7 +180,7 @@ async function own(lockPath: string): Promise<OwnershipLock | undefined> {
 		return undefined;
 	}
 	try {
-		db.exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS own (x INT); INSERT INTO own VALUES (1);");
+		db.exec("PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS own (x INT PRIMARY KEY); INSERT OR REPLACE INTO own VALUES (1);");
 	} catch {
 		try {
 			db.close();

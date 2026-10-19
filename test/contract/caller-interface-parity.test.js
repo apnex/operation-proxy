@@ -6,7 +6,10 @@
 // same process over a real channel socket and AGP's production in-process carrier, the hop intact, its
 // allowance stated: every case, none excluded, each judged by PX5's rule. The harness's fault hook makes the
 // client half's own clock port throw, never the proxy half's or the call layer's beneath it, and reports each
-// throw (PX10; zorg's EM12). Needs Unix sockets; spawns no child process.
+// throw (PX10; zorg's EM12). From zorg's Delta 4, stage 6, the suite's rows `answer-in-parts` and
+// `cancel-invocation` run through the hop too, its fixture hosts keeping time on the clock port the harness gives
+// as `callClock`; test/contract/browser-adapter.test.js runs the same two rows through the browser adapter.
+// Needs Unix sockets; spawns no child process.
 //
 // The same parity holds for the types (zorg's target, EM12): test/types/caller-interface-parity.ts, a strict
 // TypeScript function accepting operation-call's OperationCaller given operation-call's caller and the client

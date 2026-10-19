@@ -12,8 +12,8 @@
 import { readCallEnding, readRefusalRecord, type CallLayerEnding, type CallLayerUnknownReason, type DeliveryReport, type HopNotDeliveredEnding, type HopUnknownEnding, type HopUnknownReason, type JsonValue, type RefusalRecord } from "@apnex/operation-call";
 import { crossesAgp, isAttemptId, isInvocationId, NAME_PATTERN, readMessage, writeEnd, type EndContent } from "@apnex/operation-call/message-format";
 
-/** The proxy's codes on a `not-delivered` ending (PX2, PX5, PX6). */
-export type ProxyCode = "proxy-unreachable" | "key-mismatch" | "version" | "deadline-passed" | "runtime-dir-unsafe";
+/** The proxy's codes on a `not-delivered` ending (PX2, PX5, PX6, PX7). */
+export type ProxyCode = "proxy-unreachable" | "key-mismatch" | "version" | "deadline-passed" | "runtime-dir-unsafe" | "proxy-stopping";
 
 /** The hop's reasons on an `unknown` ending the client half decides (PX6): the reasons a hop adds (EM12). */
 export type HopReason = HopUnknownReason;
@@ -49,13 +49,16 @@ export type { HopUnknownEnding };
  */
 export type ProxiedEnding = CallLayerEnding | ProxyNotDeliveredEnding | HopUnknownEnding;
 
-/** The proxy's own ending in an `end` message: `deadline-passed` (PX5). */
-export type DeadlinePassedEnding = ProxyNotDeliveredEnding & { readonly proxyCode: "deadline-passed" };
+/** The proxy's own ending in an `end` message: `deadline-passed` (PX5), or `proxy-stopping` (PX7). */
+export type DeadlinePassedEnding = ProxyNotDeliveredEnding & { readonly proxyCode: "deadline-passed" | "proxy-stopping" };
 
-/** The ending the proxy itself writes in an `end` message: the call layer's, or its `deadline-passed`. */
+/** The ending the proxy itself writes in an `end` message: the call layer's, or its `deadline-passed` or `proxy-stopping`. */
 export type CarriedEnding = CallLayerEnding | DeadlinePassedEnding;
 
-const UNKNOWN_REASONS: readonly CallLayerUnknownReason[] = ["bound-passed", "operation-failed", "answer-not-sendable"];
+/** The proxy's codes an `end` message may carry, on a `not-delivered` ending of its own (PX6). */
+const CARRIED_PROXY_CODES: readonly ProxyCode[] = ["deadline-passed", "proxy-stopping"];
+
+const UNKNOWN_REASONS: readonly CallLayerUnknownReason[] = ["bound-passed", "operation-failed", "answer-not-sendable", "part-missing"];
 
 /** True for a plain object, not null and not an array. */
 export function isObject(value: unknown): value is { readonly [name: string]: unknown } {
@@ -89,7 +92,8 @@ function keepsCallLayerRules(invocation: string, attempt: string, operation: str
  * Reads the `ending` of an `end` message or a `CallLayerCaller.invoke` result as plain data through
  * operation-call's `readCallEnding` and `readRefusalRecord` (PX4, PX6, PX9; zorg's D54, D55): the call layer's
  * ending as EM12 gives it - exactly its fields, naming the invocation and the operation it was asked for, its
- * answer or refusal keeping the call layer's JSON, number and depth rules - or the proxy's `deadline-passed`.
+ * answer or refusal keeping the call layer's JSON, number and depth rules - or the proxy's `deadline-passed` or
+ * `proxy-stopping`.
  * Anything else is undefined (with any native promises observed by `readCallEnding`).
  */
 export function readCarriedEnding(value: unknown, invocation: string, operation: string): CarriedEnding | undefined {
@@ -108,7 +112,7 @@ export function readCarriedEnding(value: unknown, invocation: string, operation:
 				? (ending as CarriedEnding) : undefined;
 		case "not-delivered": {
 			const ofCallLayer = callAttempt && typeof ending.agpCode === "string" && ending.proxyCode === null;
-			const ofProxy = attempt === null && ending.agpCode === null && ending.proxyCode === "deadline-passed";
+			const ofProxy = attempt === null && ending.agpCode === null && CARRIED_PROXY_CODES.includes(ending.proxyCode as ProxyCode);
 			return ofCallLayer || ofProxy ? (ending as CarriedEnding) : undefined;
 		}
 		case "unknown":

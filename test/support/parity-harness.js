@@ -11,6 +11,9 @@
 // records each throw. What the client half keeps is observed at its edges: the timers on that port, the
 // connections it holds its process open by, and the connections it is still making. Its next preparing is
 // refused by the proxy itself - `key-mismatch` - when its `hello` names another identity than the proxy's.
+// The suite's fixture hosts keep time on a clock port over the same timeline, which the harness gives as
+// `callClock` (zorg's EM12; Delta 4, stage 6).
+import { callClockOf } from "@apnex/operation-proxy";
 import { machineClock } from "../../dist/machine-clock-adapter.js";
 import { openHop } from "./hop.js";
 import { createManualHopClock } from "./manual-hop-clock.js";
@@ -133,8 +136,12 @@ export function parityHarness({ allowanceMs = 50 } = {}) {
 				if (options.realCallClock) throw new Error(`${what}: this session runs on CLOCK_MONOTONIC, which no hook moves`);
 				return clock;
 			};
+			// The suite's fixture hosts keep time on the call bound's timeline, the clock the proxy's call and the
+			// client half read (zorg's EM12; PX10).
+			const hostClock = callClockOf(clock);
 			const hooks = {
 				...t.hooks,
+				callClock: () => hostClock,
 				advanceCallClock: (ms) => manual("advanceCallClock").advance(ms),
 				moveCallClock: (ms) => manual("moveCallClock").move(ms),
 				failCallClock: (at) => clientClock.arm(at),

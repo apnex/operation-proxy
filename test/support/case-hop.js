@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { createProxyClient } from "@apnex/operation-proxy";
+import { callClockOf, createProxyClient } from "@apnex/operation-proxy";
 import { connectChannel } from "../../dist/machine-channel-adapter.js";
 import { machineIdentities } from "../../dist/machine-clock-adapter.js";
 import { readyAll, openFixtureHost } from "./fixture-hosts.js";
@@ -43,8 +43,10 @@ export function watch(promise) {
 export async function openCase(options = {}) {
 	const clock = options.clock ?? createManualHopClock();
 	const hop = await openHop({ ...options, clock });
-	const a = await openFixtureHost(hop.t.hosts[0], ["fixture", "other"]);
-	const b = await openFixtureHost(hop.t.hosts[1]);
+	// The hosts keep time on the hop's clock, so their signs of life move as the case moves it (EM11).
+	const hostClock = callClockOf(clock);
+	const a = await openFixtureHost(hop.t.hosts[0], ["fixture", "other"], hostClock);
+	const b = await openFixtureHost(hop.t.hosts[1], ["fixture"], hostClock);
 	await readyAll(hop.t.hooks, "host-a", ["fixture", "other"]);
 	await readyAll(hop.t.hooks, "host-b");
 	const c = {
@@ -104,6 +106,10 @@ export async function rawConnection(socketPath) {
 	return {
 		lines,
 		closed: () => closed,
+		/** Stops reading, so what the proxy writes stays unread, in the kernel and then unwritten at the proxy. */
+		pause: () => socket.pause(),
+		/** Reads again. */
+		resume: () => socket.resume(),
 		write: (text) => socket.write(text),
 		send: (message) => socket.write(`${JSON.stringify(message)}\n`),
 		end: () => socket.destroy(),

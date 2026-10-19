@@ -19,6 +19,14 @@
  * abort is relayed across the hop and changes the ending only as the call layer decides it, never here.
  * Endings of the client half's own checks come before these events, which follow those checks (PX6).
  *
+ * A call request giving `onPart` is written with `parts` true (zorg's Delta 4, stage 6; D64). Its deadline is
+ * then a deadline on signs of life: each `part` or `alive` read before it moves it to the bound after the moment
+ * it was read, one read at or after it ending the invocation `hop-stalled`; each part taken is given to `onPart`
+ * at once, synchronously and in order, never awaited. From an abort, a sign of life moves the deadline to the
+ * bound after the abort and no further (Delta 4's amendment 4). The client half writes at most one `abort` for
+ * a request: as the caller's signal fires once it is written, and, for an invocation in parts, as it ends it
+ * `hop-stalled` with its connection open, so the proxy's call is cancelled rather than left running (PX5).
+ *
  * A clock port that throws is a fault of the port (EM12): a reading that fails as an event is observed shows
  * nothing passed, so that event decides; a timer whose wakeup cannot read the clock takes its own word that
  * the deadline came; and settling resolves the chosen ending and releases its accounting before any step of
@@ -27,7 +35,7 @@
  */
 import { readCallRequest, type CallRequest, type IdentitySource, type JsonValue, type OperationCaller, type RefusalRecord } from "@apnex/operation-call";
 import { requestSendable, writeRequest } from "@apnex/operation-call/message-format";
-import { toCanonicalJson, utf8ByteLength } from "@apnex/shape-check";
+import { observePromises, toCanonicalJson, utf8ByteLength } from "@apnex/shape-check";
 import { CHANNEL_LIMITS, writeInvoke } from "./channel-messages.js";
 import { Preparer, type ClientConnector, type Connection, type Prepared, type Waiter, type WrittenInvocation } from "./client-preparing.js";
 import { hopUnknown, preparingNotDelivered, proxyNotDelivered, type CarriedEnding, type PreparingEnding, type ProxiedEnding } from "./endings.js";
@@ -144,18 +152,20 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 		// CallRequest at most once through operation-call's readCallRequest.
 		const start = clock.nowNs();
 		const checked = readCallRequest(call);
-		const { host, service, operation, input, bound, repeat, signal } = checked;
+		const { host, service, operation, input, bound, repeat, signal, onPart } = checked;
+		const parts = onPart !== undefined;
 		const invocation = checked.invocation ?? newInvocation();
-		const deadline = start + msToNs(bound);
-		const sooner = deadline - msToNs(allowanceFor(allowanceMs, bound));
+		const boundNs = msToNs(bound);
+		const firstDeadline = start + boundNs;
+		const sooner = firstDeadline - msToNs(allowanceFor(allowanceMs, bound));
 		// The call layer's own checks on the caller's side (EM11), on the request it will send for this call, and
 		// the line the invocation is written on (PX4).
 		const attempt = `${invocation}.${randomHex(8)}`;
-		const fields = { invocation, host, service, operation, input, deadline: sooner.toString(), repeat };
+		const fields = { invocation, host, service, operation, input, deadline: sooner.toString(), repeat, parts };
 		const sendable = requestSendable(writeRequest({ invocation, attempt, operation }, input)) && fitsLine(fields);
 		// Checked: the clock is read again, so a deadline that passed while checking - at it exactly included - wins
 		// over a refusal the checks found, as in the call layer's caller, and nothing is written (PX5).
-		if (clock.nowNs() >= deadline) {
+		if (clock.nowNs() >= firstDeadline) {
 			return Promise.resolve(Object.freeze({ ending: "unknown", invocation, attempt, operation, reason: "bound-passed", agpCode: null, deliveryReport: null }));
 		}
 		if (!sendable) return Promise.resolve(Object.freeze({ ending: "refused", invocation, attempt, operation, refusal: notSendable() }));
@@ -165,6 +175,12 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 			let connection: Connection | undefined;
 			let request: number | undefined;
 			let timer: HopTimer | undefined;
+			/** The client half's deadline: for an invocation in parts, a deadline on signs of life (PX5). */
+			let deadline = firstDeadline;
+			/** For an invocation in parts, the moment the caller's signal fired, from which a bound is the latest deadline. */
+			let abortedAt: bigint | undefined = parts && signal?.aborted === true ? start : undefined;
+			/** Whether an `abort` for the request has crossed, or `aborted` true was written with it: at most one goes (PX5). */
+			let abortSent = false;
 			/**
 			 * Settles the chosen ending: its accounting is released and the ending resolved first, and then each step
 			 * of cleanup runs on its own, so a step that throws - a clock port that cannot cancel its timer among them
@@ -195,23 +211,74 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 				if (decided) return;
 				decide(passed() ? hopUnknown("hop-stalled", invocation, operation) : ending());
 			};
+			/** Writes the request's one `abort`, while its connection is open (PX5). */
+			const sendAbort = (): void => {
+				if (abortSent || connection === undefined || request === undefined) return;
+				abortSent = true;
+				connection.abort(request);
+			};
+			/**
+			 * Ends the invocation `hop-stalled`: its deadline came before its `end` was read. One in parts then writes
+			 * its `abort`, so the proxy's call is cancelled rather than left running (PX5).
+			 */
+			const stall = (): void => {
+				if (decided) return;
+				decide(hopUnknown("hop-stalled", invocation, operation));
+				if (parts) guarded(sendAbort);
+			};
+			/**
+			 * A `part` or an `alive` of an invocation in parts, read now (PX5): discarded once the invocation is
+			 * decided; read at or after the deadline, it is not taken and the deadline has come; otherwise it moves the
+			 * deadline to the bound after now, or after the abort when the caller's signal has fired, and a part is
+			 * given to `onPart`. A reading the port cannot give is a fault of the port, which shows nothing passed and
+			 * moves nothing, and the sign is taken (EM12).
+			 */
+			const sign = (part?: { readonly sequence: number; readonly answer: JsonValue }): void => {
+				if (decided) return;
+				let now: bigint | undefined;
+				try {
+					now = clock.nowNs();
+				} catch {
+					now = undefined;
+				}
+				if (now !== undefined && now >= deadline) return stall();
+				if (now !== undefined) {
+					const moved = now + boundNs;
+					const latest = abortedAt === undefined ? moved : abortedAt + boundNs;
+					const next = moved < latest ? moved : latest;
+					if (next > deadline) deadline = next;
+				}
+				if (part === undefined || onPart === undefined) return;
+				const given = Object.freeze({ sequence: part.sequence, answer: part.answer });
+				try {
+					observePromises(onPart(given));
+				} catch (error) {
+					observePromises(error);
+				}
+			};
 			const written: WrittenInvocation = {
 				invocation,
 				operation,
+				parts,
 				ended: (ending: CarriedEnding) => read(() => ending),
+				part: (sequence: number, answer: JsonValue) => sign({ sequence, answer }),
+				alive: () => sign(),
 				lost: () => read(() => hopUnknown("proxy-lost", invocation, operation)),
 			};
 			const write = (c: Connection): void => {
 				if (decided) return;
 				if (passed()) return decide(hopUnknown("hop-stalled", invocation, operation));
-				const number = c.write(written, { ...fields, aborted: signal?.aborted === true });
+				const aborted = signal?.aborted === true;
+				const number = c.write(written, { ...fields, aborted });
 				// Nothing of it was written: a connection closed before writing is no proxy at all (PX6).
 				if (number === undefined) return acquire();
 				connection = c;
 				request = number;
+				// Written already aborted, the proxy's call is made with its signal fired: no `abort` follows.
+				if (aborted) abortSent = true;
 			};
 			const waiter: Waiter = {
-				deadline,
+				deadline: firstDeadline,
 				settle: (prepared: Prepared) => {
 					if (decided) return;
 					switch (prepared.kind) {
@@ -227,16 +294,43 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 				if (current !== undefined) write(current);
 				else preparer.wait(waiter);
 			};
-			/** Relays the process's abort across the hop once the invocation is written; before, `aborted` carries it. */
+			/**
+			 * Relays the process's abort across the hop once the invocation is written; before, `aborted` carries it.
+			 * For an invocation in parts it notes the moment, a bound after which is its latest deadline (PX5); a
+			 * reading the port cannot give leaves the deadline where it stands, which is within a bound of the abort.
+			 */
 			const relay = (): void => {
-				if (!decided && connection !== undefined && request !== undefined) connection.abort(request);
-			};
-			timer = atMoment(clock, deadline, () => {
 				if (decided) return;
-				decide(request === undefined
-					? proxyNotDelivered("proxy-unreachable", invocation, operation, repeat)
-					: hopUnknown("hop-stalled", invocation, operation));
-			});
+				if (parts && abortedAt === undefined) {
+					try {
+						abortedAt = clock.nowNs();
+					} catch {
+						abortedAt = deadline - boundNs;
+					}
+				}
+				sendAbort();
+			};
+			/** The deadline came on the clock, unless a sign of life moved it meanwhile, when the timer is set again. */
+			const atDeadline = (): void => {
+				if (decided) return;
+				let now: bigint | undefined;
+				try {
+					now = clock.nowNs();
+				} catch {
+					// The port failed: the timer's word is taken that the deadline came (EM12).
+				}
+				if (now !== undefined && now < deadline) {
+					try {
+						timer = atMoment(clock, deadline, atDeadline);
+						return;
+					} catch {
+						// A timer that cannot be set again leaves the timer's word to stand.
+					}
+				}
+				if (request === undefined) decide(proxyNotDelivered("proxy-unreachable", invocation, operation, repeat));
+				else stall();
+			};
+			timer = atMoment(clock, deadline, atDeadline);
 			signal?.addEventListener("abort", relay, { once: true });
 			acquire();
 		});
@@ -302,7 +396,7 @@ function guarded(step: () => void): void {
 }
 
 /** True when an invocation's `invoke` line fits the channel's line limit, its newline included (PX4). */
-function fitsLine(fields: { readonly invocation: string; readonly host: string; readonly service: string; readonly operation: string; readonly input: JsonValue; readonly deadline: string; readonly repeat: boolean }): boolean {
+function fitsLine(fields: { readonly invocation: string; readonly host: string; readonly service: string; readonly operation: string; readonly input: JsonValue; readonly deadline: string; readonly repeat: boolean; readonly parts: boolean }): boolean {
 	// The longest request number and the same deadline, so the line written can only be as long or shorter.
 	const probe = writeInvoke({ ...fields, request: Number.MAX_SAFE_INTEGER, aborted: false });
 	return utf8ByteLength(toCanonicalJson(probe as unknown as JsonValue)) + 1 <= CHANNEL_LIMITS.lineBytes;

@@ -19,8 +19,8 @@
  * Nothing here is particular to one runtime.
  */
 import type { ChannelLink, LinkHandlers } from "./channel-link.js";
-import { readEnd, readWelcomeOrRefused, writeHello, type InvokeFields, writeAbort, writeInvoke, type RefusalCode } from "./channel-messages.js";
-import type { CarriedEnding } from "./endings.js";
+import { readProxyMessage, readWelcomeOrRefused, writeHello, type InvokeFields, writeAbort, writeInvoke, type RefusalCode } from "./channel-messages.js";
+import type { CarriedEnding, JsonValue } from "./endings.js";
 import { atMoment, msToNs, type HopClock, type HopTimer } from "./hop-clock.js";
 import type { ProxyKey } from "./key.js";
 
@@ -51,8 +51,14 @@ export interface ClientConnector {
 export interface WrittenInvocation {
 	readonly invocation: string;
 	readonly operation: string;
+	/** True when it is written with `parts` true, so a `part` and an `alive` of it fit the table (PX4). */
+	readonly parts: boolean;
 	/** Its `end` was read; whether it is taken is the invocation's to decide by its deadline. */
 	ended(ending: CarriedEnding): void;
+	/** Its next `part` was read, in order; whether it is taken is the invocation's to decide (PX5). */
+	part(sequence: number, answer: JsonValue): void;
+	/** An `alive` of it was read; whether it is taken is the invocation's to decide (PX5). */
+	alive(): void;
 	/** The connection closed, or carried a malformed line, after the invocation was written. */
 	lost(): void;
 }
@@ -83,7 +89,7 @@ export class Connection {
 	write(written: WrittenInvocation, fields: Omit<InvokeFields, "request">): number | undefined {
 		if (!this.#open) return undefined;
 		const request = this.#next++;
-		const entry: Asked = { written, decided: false, writing: true };
+		const entry: Asked = { written, decided: false, writing: true, nextSequence: 1 };
 		this.#asked.set(request, entry);
 		this.#waiting++;
 		this.link.hold(true);
@@ -139,22 +145,36 @@ export class Connection {
 	}
 
 	/**
-	 * A message read once welcomed: only an `end` for a request written and not yet ended fits the table. Reading
-	 * it decides the request - taken, or discarded as late - so its accounting is released before its entry is
-	 * removed; an `end` for a request already decided, by its deadline, is a late end, discarded.
+	 * A message read once welcomed: only an `end`, a `part` or an `alive` for a request written and not yet ended
+	 * fits the table, a `part` and an `alive` only for one written with `parts` true and a part only with the next
+	 * `sequence`, which it advances (PX4). It is checked first, and then given to its invocation, which takes it or
+	 * discards it as late; a message that breaks the table closes the connection whatever its invocation decided.
+	 * Reading an `end` decides the request, so its accounting is released before its entry is removed.
 	 */
 	readonly message = (value: unknown): void => {
 		if (!this.#open) return;
-		const end = readEnd(value, (request) => this.#asked.get(request)?.written);
-		const entry = end === undefined ? undefined : this.#asked.get(end.request);
-		if (end === undefined || entry === undefined) {
+		const read = readProxyMessage(value, (request) => {
+			const asked = this.#asked.get(request);
+			return asked === undefined ? undefined : { invocation: asked.written.invocation, operation: asked.written.operation, parts: asked.written.parts, nextSequence: asked.nextSequence };
+		});
+		const entry = read === undefined ? undefined : this.#asked.get(read.request);
+		if (read === undefined || entry === undefined) {
 			this.link.close();
 			return;
 		}
+		if (read.type === "part") {
+			entry.nextSequence++;
+			entry.written.part(read.sequence, read.answer);
+			return;
+		}
+		if (read.type === "alive") {
+			entry.written.alive();
+			return;
+		}
 		this.#release(entry);
-		this.#asked.delete(end.request);
+		this.#asked.delete(read.request);
 		entry.told = true;
-		entry.written.ended(end.ending);
+		entry.written.ended(read.ending);
 	};
 
 	/** The connection closed: every invocation written on it and still waiting is lost. */
@@ -186,6 +206,8 @@ interface Asked {
 	writing: boolean;
 	/** Its invocation has been told its `end` or its loss, or nothing of it was written: it is told nothing more. */
 	told?: boolean;
+	/** The `sequence` its next part must hold (PX4). */
+	nextSequence: number;
 }
 
 /** What a waiter learns. */

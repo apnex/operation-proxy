@@ -12,12 +12,19 @@
  * Because a MessagePort reports no closing, each side sends `{"operationProxy": 1, "type": "ping"}` every
  * 5 seconds from the moment the port connects (before and after `welcome`) and treats a peer silent for
  * 15 seconds as gone, the page then ending its written invocations `unknown` with `proxy-lost`.
+ *
+ * Parts and `alive` cross as on a machine (zorg's Delta 4, stage 6; D64). Since a port reports nothing written or
+ * unread, the page posts `{"operationProxy": 1, "type": "taken", "request"}`, with the part's `sequence` added for
+ * a part, once it has read each `part` and `alive`; the worker counts the bytes, as JSON in UTF-8, of each it
+ * posts until its `taken` arrives, matching each `taken` with the oldest `part` or `alive` of its request not yet
+ * taken, and a post that would make the count exceed 33570816 bytes is not posted: the port is closed at once and
+ * its invocations in parts aborted (PX6, PX8). A `taken` that matches none closes the port.
  * Nothing here imports a Node module or uses a Node global (principle 6).
  */
 import type { CallClock, IdentitySource } from "@apnex/operation-call";
-import { observePromises, readPlainJson } from "@apnex/shape-check";
+import { observePromises, readPlainJson, utf8ByteLength } from "@apnex/shape-check";
 import type { ChannelLink, LinkHandlers } from "./channel-link.js";
-import { CHANNEL_VERSION, type ChannelMessage } from "./channel-messages.js";
+import { CHANNEL_LIMITS, CHANNEL_VERSION, isRequestNumber, type ChannelMessage } from "./channel-messages.js";
 import { allowanceFor, checkHopAllowance, createProxyClient, DEFAULT_HOP_ALLOWANCE_MS, type ProxyClient } from "./client-half.js";
 import { atMoment, callClockOf, msToNs, NS_PER_MS, type HopClock, type HopTimer, type PinnableCallClock } from "./hop-clock.js";
 import { checkKey, keyDigest, type ProxyKey } from "./key.js";
@@ -128,6 +135,23 @@ export const defaultBrowserIdentities: IdentitySource = Object.freeze({
 	},
 });
 
+/** A `taken` message, posted by a page once it has read a `part` or an `alive` (PX8). */
+export interface TakenMessage {
+	readonly operationProxy: 1;
+	readonly type: "taken";
+	readonly request: number;
+	/** The part's `sequence`, present for a part and absent for an `alive`. */
+	readonly sequence?: number;
+}
+
+/** What a side of a browser port does beyond carrying PX4's messages (PX8). */
+interface PortSide {
+	/** The page: post a `taken` for each `part` and `alive` read, once read. */
+	readonly acknowledge?: boolean;
+	/** The worker: count each `part` and `alive` posted until its `taken` arrives, within the bound. */
+	readonly bounded?: boolean;
+}
+
 /** True when a plain JSON value is `{"operationProxy": 1, "type": "ping"}` with no extra fields. */
 function isPing(value: unknown): value is PingMessage {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -148,11 +172,30 @@ function portChannelLink(
 	handlers: LinkHandlers,
 	transformOutgoing: (msg: ChannelMessage) => unknown,
 	transformIncoming: (msg: { readonly [k: string]: unknown }) => unknown,
+	side: PortSide = {},
 ): ChannelLink {
 	let open = true;
 	let pingTimer: HopTimer | undefined;
 	let livenessTimer: HopTimer | undefined;
 	let lastHeardAt = clock.nowNs();
+	/** On the worker: each `part` and `alive` posted and not yet taken, by request, oldest first, and their bytes. */
+	const posted = new Map<number, { readonly sequence: number | undefined; readonly bytes: number }[]>();
+	let postedBytes = 0;
+
+	/** On the worker: takes a `taken`, true when it matches the oldest `part` or `alive` of its request not yet taken. */
+	const take = (value: { readonly [k: string]: unknown }): boolean => {
+		const keys = Object.keys(value);
+		const hasSequence = Object.hasOwn(value, "sequence");
+		if (keys.length !== (hasSequence ? 4 : 3) || !isRequestNumber(value.request)) return false;
+		const queue = posted.get(value.request);
+		const oldest = queue?.[0];
+		if (queue === undefined || oldest === undefined) return false;
+		if (oldest.sequence === undefined ? hasSequence : value.sequence !== oldest.sequence) return false;
+		queue.shift();
+		if (queue.length === 0) posted.delete(value.request);
+		postedBytes -= oldest.bytes;
+		return true;
+	};
 
 	const stopTimers = (): void => {
 		try { pingTimer?.cancel(); } catch { /* ignore */ }
@@ -213,12 +256,27 @@ function portChannelLink(
 		lastHeardAt = clock.nowNs();
 		armLiveness();
 		if (isPing(plain.value)) return;
-		const transformed = transformIncoming(plain.value as { readonly [k: string]: unknown });
+		const value = plain.value as { readonly [k: string]: unknown };
+		if (side.bounded && value.operationProxy === CHANNEL_VERSION && value.type === "taken") {
+			if (!take(value)) closeLink();
+			return;
+		}
+		const transformed = transformIncoming(value);
 		if (transformed === undefined) {
 			closeLink();
 			return;
 		}
 		handlers.message(transformed);
+		// The page has read it - a part given to onPart, or discarded - unless it broke the table and closed the port.
+		if (!side.acknowledge || !open || (value.type !== "part" && value.type !== "alive")) return;
+		const taken: TakenMessage = value.type === "part"
+			? { operationProxy: CHANNEL_VERSION, type: "taken", request: value.request as number, sequence: value.sequence as number }
+			: { operationProxy: CHANNEL_VERSION, type: "taken", request: value.request as number };
+		try {
+			port.postMessage(taken);
+		} catch {
+			closeLink();
+		}
 	};
 
 	if (typeof port.addEventListener === "function") {
@@ -234,7 +292,22 @@ function portChannelLink(
 		write(message: ChannelMessage): boolean {
 			if (!open) return false;
 			try {
-				port.postMessage(transformOutgoing(message));
+				const outgoing = transformOutgoing(message);
+				if (side.bounded && (message.type === "part" || message.type === "alive")) {
+					const bytes = utf8ByteLength(JSON.stringify(outgoing));
+					if (postedBytes + bytes > CHANNEL_LIMITS.unwrittenBytes) {
+						// Not posted: the port is closed at once, and its invocations in parts aborted (PX8).
+						closeLink();
+						return false;
+					}
+					port.postMessage(outgoing);
+					const queue = posted.get(message.request) ?? [];
+					queue.push({ sequence: message.type === "part" ? message.sequence : undefined, bytes });
+					posted.set(message.request, queue);
+					postedBytes += bytes;
+					return true;
+				}
+				port.postMessage(outgoing);
 				return true;
 			} catch {
 				closeLink();
@@ -288,6 +361,7 @@ export function createBrowserClient(application: BrowserClientApplication, optio
 						return { ...message, deadline: remainingMs };
 					},
 					(incoming) => incoming,
+					{ acknowledge: true },
 				);
 				return { kind: "connected", link };
 			},
@@ -517,6 +591,7 @@ export function runBrowserProxy(application: BrowserProxyApplication, options: B
 				const workerDeadlineNs = nowNs + msToNs(flooredMs);
 				return { ...incoming, deadline: workerDeadlineNs.toString() };
 			},
+			{ bounded: true },
 		);
 		links.add(link);
 		handlers = half.accept(link);

@@ -8,8 +8,9 @@
  * is held another proxy owns the key, and this one stops, touching nothing. Only the owner touches the
  * channel socket: it removes any socket left at that path, listens there, and then builds its caller.
  *
- * Stopping (PX7): when the idle timer finds the proxy idle, and on `SIGTERM` or `SIGINT` once each call in
- * flight has ended and its ending has been sent, the proxy stops accepting connections, closes those not
+ * Stopping (PX7): on `SIGTERM` or `SIGINT` it takes no more invocations, answering each `proxy-stopping`, and
+ * cancels each invocation in parts in flight; when the idle timer finds the proxy idle, and on those signals once
+ * each call in flight has ended and its ending has been sent, the proxy stops accepting connections, closes those not
  * welcomed and then the rest, closes and removes the channel socket, stops its caller, and releases the ownership lock last, so the next owner can take the key only after the last step. A start that fails
  * after taking ownership - an observer throwing at `owned` or `listening`, or a clock reading failing, included -
  * stops its idle timer and closes what it opened, its connections, the channel's server and then ownership, before
@@ -21,6 +22,7 @@ import net from "node:net";
 import type { CallClock, IdentitySource } from "@apnex/operation-call";
 import { observePromises } from "@apnex/shape-check";
 import type { LinkHandlers } from "./channel-link.js";
+import { CHANNEL_LIMITS } from "./channel-messages.js";
 import { createProxyClient, checkHopAllowance, DEFAULT_HOP_ALLOWANCE_MS, type ProxyClient } from "./client-half.js";
 import { callClockOf, type HopClock, type PinnableCallClock } from "./hop-clock.js";
 import { checkKey, keyDigest, type ProxyKey } from "./key.js";
@@ -251,7 +253,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		sockets.add(socket);
 		socket.on("close", () => sockets.delete(socket));
 		let handlers: LinkHandlers | undefined;
-		const link = socketLink(socket, { message: (value) => handlers?.message(value), closed: () => handlers?.closed() });
+		const link = socketLink(socket, { message: (value) => handlers?.message(value), closed: () => handlers?.closed() }, { maxUnwrittenBytes: CHANNEL_LIMITS.unwrittenBytes });
 		handlers = half.accept(link);
 	};
 
@@ -558,6 +560,12 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		stop(): void {
 			if (stopping || draining) return;
 			draining = true;
+			// No invocation is taken from now on, and each in parts is cancelled, so its call ends within its bound (PX7).
+			try {
+				proxyHalf.stopInvocations();
+			} catch (error) {
+				observePromises(error);
+			}
 			proxyHalf.drained().then(() => stopNow(0)).catch(() => undefined);
 		},
 	});

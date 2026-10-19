@@ -9,18 +9,21 @@
  * | client to proxy | hello | key |
  * | proxy to client | welcome | none |
  * | proxy to client | refused | code: key-mismatch or version |
- * | client to proxy | invoke | request, invocation, host, service, operation, input, deadline, repeat, aborted |
+ * | client to proxy | invoke | request, invocation, host, service, operation, input, deadline, repeat, aborted, parts |
  * | client to proxy | abort | request |
  * | proxy to client | end | request, ending |
+ * | proxy to client | part | request, sequence, answer |
+ * | proxy to client | alive | request |
  *
  * `deadline` is the moment the proxy's call's bound passes (PX5): on a machine, nanoseconds on Linux's
  * CLOCK_MONOTONIC, written in decimal as a JSON string, so a reading past 2^53 nanoseconds keeps every digit.
  * The readers give a message only when it has exactly its type's form, and undefined otherwise, which closes
- * the connection. Nothing here is particular to one runtime.
+ * the connection. A `part` and an `alive` go only for a request written with `parts` true, before its `end`
+ * (zorg's Delta 4, stage 6; D64). Nothing here is particular to one runtime.
  */
 import type { JsonValue } from "@apnex/operation-call";
 import { readPlainJson } from "@apnex/shape-check";
-import { isInvocationId, MESSAGE_LIMITS, NAME_PATTERN } from "@apnex/operation-call/message-format";
+import { crossesAgp, isInvocationId, MESSAGE_LIMITS, NAME_PATTERN, readMessage, writePart } from "@apnex/operation-call/message-format";
 import { hasExactly, isObject, readCarriedEnding, type CarriedEnding } from "./endings.js";
 import type { ProxyKey } from "./key.js";
 
@@ -35,6 +38,11 @@ export const CHANNEL_LIMITS = Object.freeze({
 	channelFieldBytes: 8192,
 	/** The longest line, its newline included: 16777216 + 8192. */
 	lineBytes: MESSAGE_LIMITS.requestBytes + 8192,
+	/**
+	 * The most a proxy keeps unwritten on one connection, or posted and not yet taken on one browser port: twice the
+	 * longest line, 33570816 bytes (PX6, PX8).
+	 */
+	unwrittenBytes: 2 * (MESSAGE_LIMITS.requestBytes + 8192),
 });
 
 /** The codes of a `refused` message. */
@@ -59,16 +67,22 @@ export interface InvokeMessage {
 	readonly deadline: string;
 	readonly repeat: boolean;
 	readonly aborted: boolean;
+	/** True when the call request gives `onPart`: the call accepts parts (PX5). */
+	readonly parts: boolean;
 }
 /** client to proxy: the process aborted the invocation; the proxy fires the call's abort signal. */
 export interface AbortMessage { readonly operationProxy: 1; readonly type: "abort"; readonly request: number }
 /** proxy to client: how the invocation ended. */
 export interface EndMessage { readonly operationProxy: 1; readonly type: "end"; readonly request: number; readonly ending: CarriedEnding }
+/** proxy to client: the next part of an invocation written with `parts` true, as the proxy's call gave it (PX5). */
+export interface PartMessage { readonly operationProxy: 1; readonly type: "part"; readonly request: number; readonly sequence: number; readonly answer: JsonValue }
+/** proxy to client: a sign of life of an invocation written with `parts` true (PX5). */
+export interface AliveMessage { readonly operationProxy: 1; readonly type: "alive"; readonly request: number }
 
 /** A message from a client to a proxy. */
 export type ClientMessage = HelloMessage | InvokeMessage | AbortMessage;
 /** A message from a proxy to a client. */
-export type ProxyMessage = WelcomeMessage | RefusedMessage | EndMessage;
+export type ProxyMessage = WelcomeMessage | RefusedMessage | EndMessage | PartMessage | AliveMessage;
 /** Any message of the channel. */
 export type ChannelMessage = ClientMessage | ProxyMessage;
 
@@ -94,7 +108,7 @@ export type InvokeFields = Omit<InvokeMessage, "operationProxy" | "type">;
 export function writeInvoke(f: InvokeFields): InvokeMessage {
 	return {
 		operationProxy: 1, type: "invoke", request: f.request, invocation: f.invocation, host: f.host, service: f.service,
-		operation: f.operation, input: f.input, deadline: f.deadline, repeat: f.repeat, aborted: f.aborted,
+		operation: f.operation, input: f.input, deadline: f.deadline, repeat: f.repeat, aborted: f.aborted, parts: f.parts,
 	};
 }
 
@@ -106,6 +120,16 @@ export function writeAbort(request: number): AbortMessage {
 /** Writes an `end`. */
 export function writeEnd(request: number, ending: CarriedEnding): EndMessage {
 	return { operationProxy: 1, type: "end", request, ending };
+}
+
+/** Writes a `part`. */
+export function writePartMessage(request: number, sequence: number, answer: JsonValue): PartMessage {
+	return { operationProxy: 1, type: "part", request, sequence, answer };
+}
+
+/** Writes an `alive`. */
+export function writeAliveMessage(request: number): AliveMessage {
+	return { operationProxy: 1, type: "alive", request };
 }
 
 /** True for a request number: a whole number from 1. */
@@ -151,11 +175,11 @@ export function readInvokeOrAbort(raw: unknown): InvokeMessage | AbortMessage | 
 	if (value === undefined) return undefined;
 	if (headed(value, "abort")) return hasExactly(value, ["operationProxy", "type", "request"]) && isRequestNumber(value.request) ? value as unknown as AbortMessage : undefined;
 	if (!headed(value, "invoke")) return undefined;
-	const names = ["operationProxy", "type", "request", "invocation", "host", "service", "operation", "input", "deadline", "repeat", "aborted"];
+	const names = ["operationProxy", "type", "request", "invocation", "host", "service", "operation", "input", "deadline", "repeat", "aborted", "parts"];
 	if (!hasExactly(value, names) || !isRequestNumber(value.request) || !isInvocationId(value.invocation)) return undefined;
 	if (typeof value.host !== "string" || value.host.length === 0) return undefined;
 	if (typeof value.service !== "string" || !NAME_PATTERN.test(value.service) || typeof value.operation !== "string" || !NAME_PATTERN.test(value.operation)) return undefined;
-	if (!isMachineDeadline(value.deadline) || typeof value.repeat !== "boolean" || typeof value.aborted !== "boolean") return undefined;
+	if (!isMachineDeadline(value.deadline) || typeof value.repeat !== "boolean" || typeof value.aborted !== "boolean" || typeof value.parts !== "boolean") return undefined;
 	return value as unknown as InvokeMessage;
 }
 
@@ -170,15 +194,39 @@ export function readWelcomeOrRefused(raw: unknown): WelcomeMessage | RefusedMess
 	return undefined;
 }
 
+/** What a client asked of a request it wrote and whose `end` it has not read. */
+export interface AskedRequest {
+	readonly invocation: string;
+	readonly operation: string;
+	/** True when it wrote the request with `parts` true. */
+	readonly parts: boolean;
+	/** The `sequence` the request's next part must hold. */
+	readonly nextSequence: number;
+}
+
 /**
- * Reads an `end` for one of the requests a client wrote, given what it asked for each; a request it never
- * wrote, or an ending not of that invocation and operation, is undefined.
+ * Reads an `end`, a `part` or an `alive` for one of the requests a client wrote and whose `end` it has not read,
+ * given what it asked of each (PX4): a request it never wrote, an ending not of that invocation and operation,
+ * a `part` or an `alive` for a request written with `parts` false, a part whose `sequence` is not the next or
+ * whose answer the call layer would not carry (EM11), or a field the table does not name, is undefined.
  */
-export function readEnd(raw: unknown, asked: (request: number) => { readonly invocation: string; readonly operation: string } | undefined): EndMessage | undefined {
+export function readProxyMessage(raw: unknown, asked: (request: number) => AskedRequest | undefined): EndMessage | PartMessage | AliveMessage | undefined {
 	const value = plainObject(raw);
-	if (value === undefined || !headed(value, "end") || !hasExactly(value, ["operationProxy", "type", "request", "ending"]) || !isRequestNumber(value.request)) return undefined;
+	if (value === undefined || !isRequestNumber(value.request)) return undefined;
 	const what = asked(value.request);
 	if (what === undefined) return undefined;
-	const ending = readCarriedEnding(value.ending, what.invocation, what.operation);
-	return ending === undefined ? undefined : Object.freeze({ operationProxy: 1, type: "end", request: value.request, ending });
+	if (headed(value, "end")) {
+		if (!hasExactly(value, ["operationProxy", "type", "request", "ending"])) return undefined;
+		const ending = readCarriedEnding(value.ending, what.invocation, what.operation);
+		return ending === undefined ? undefined : Object.freeze({ operationProxy: 1, type: "end", request: value.request, ending });
+	}
+	if (!what.parts) return undefined;
+	if (headed(value, "alive")) return hasExactly(value, ["operationProxy", "type", "request"]) ? Object.freeze({ operationProxy: 1, type: "alive", request: value.request }) : undefined;
+	if (!headed(value, "part") || !hasExactly(value, ["operationProxy", "type", "request", "sequence", "answer"]) || value.sequence !== what.nextSequence) return undefined;
+	// The answer keeps the call layer's rules: the part message the call layer carries it in is one it reads and
+	// one that crosses AGP whole (EM11), so a part reaches `onPart` exactly as a direct call would give it.
+	const answer = value.answer as JsonValue;
+	const carried = writePart({ invocation: what.invocation, attempt: `${what.invocation}.00000000`, operation: what.operation }, what.nextSequence, answer);
+	if (readMessage(carried) === undefined || !crossesAgp(carried as unknown as JsonValue)) return undefined;
+	return Object.freeze({ operationProxy: 1, type: "part", request: value.request, sequence: what.nextSequence, answer });
 }

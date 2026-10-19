@@ -7,6 +7,13 @@
 // in-process carrier, every direct call the proxy makes recorded - its moment, bound and abort - and the
 // ending checked against it. The cases marked "(processes)" also run the proxy as a real child process. Three
 // PX4 cases instead join the public halves by a channel that delivers each message within the write sending it.
+//
+// The cases marked "D4-E6" carry answers in parts and cancelling across the hop (zorg's Delta 4, stage 6, and its
+// amendment 4): `parts` written, parts given to `onPart` as they are read, the proxy's `alive` and its schedule,
+// the client half's deadline on signs of life and an abort bounding it, the one `abort` a request writes, the
+// table's new breaks, the machine's bound on bytes unwritten, and a proxy stopped, a proxy killed and a client
+// killed during an invocation in parts. Their hosts keep time on the hop's clock, which most advance in small
+// steps, letting the socket and AGP carry what each step started, as time passing does.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -48,9 +55,9 @@ test("PX4: the whole wire record of two calls alike but for their service, reach
 		assert.deepEqual(c.wire, [
 			{ to: "proxy", message: { operationProxy: 1, type: "hello", key: { application: KEY.application, identity: KEY.identity, target: KEY.target } } },
 			{ to: "client", message: { operationProxy: 1, type: "welcome" } },
-			{ to: "proxy", message: { operationProxy: 1, type: "invoke", request: 1, invocation: one.invocation, host: "host-a", service: "fixture", operation: "which", input: { n: 1 }, deadline, repeat: false, aborted: false } },
+			{ to: "proxy", message: { operationProxy: 1, type: "invoke", request: 1, invocation: one.invocation, host: "host-a", service: "fixture", operation: "which", input: { n: 1 }, deadline, repeat: false, aborted: false, parts: false } },
 			{ to: "client", message: { operationProxy: 1, type: "end", request: 1, ending: one } },
-			{ to: "proxy", message: { operationProxy: 1, type: "invoke", request: 2, invocation: two.invocation, host: "host-a", service: "other", operation: "which", input: { n: 1 }, deadline, repeat: false, aborted: false } },
+			{ to: "proxy", message: { operationProxy: 1, type: "invoke", request: 2, invocation: two.invocation, host: "host-a", service: "other", operation: "which", input: { n: 1 }, deadline, repeat: false, aborted: false, parts: false } },
 			{ to: "client", message: { operationProxy: 1, type: "end", request: 2, ending: two } },
 		]);
 		assert.deepEqual(c.calls.map((r) => [r.call.service, r.call.operation, r.bound, r.at, r.call.invocation, r.call.repeat]), [
@@ -110,11 +117,11 @@ test("PX4: one connection carries invocations at once, their ends in any order p
 		assert.deepEqual(c.hop.sent("end").map((e) => e.request), [2, 1], "the ends arrived in the other order, paired by request");
 		const raw = await rawConnection(c.hop.socketPath);
 		raw.send({ operationProxy: 1, type: "hello", key: KEY });
-		raw.send({ operationProxy: 1, type: "invoke", request: 1, invocation: "1791540000000-0123456789abcdef", host: "host-a", service: "fixture", operation: "echo", input: "x", deadline: c.deadline(0, 1000, 50), repeat: false, aborted: false });
+		raw.send({ operationProxy: 1, type: "invoke", request: 1, invocation: "1791540000000-0123456789abcdef", host: "host-a", service: "fixture", operation: "echo", input: "x", deadline: c.deadline(0, 1000, 50), repeat: false, aborted: false, parts: false });
 		await until(() => raw.lines.length === 2, "welcome and end");
 		raw.send({ operationProxy: 1, type: "abort", request: 1 });
 		raw.send({ operationProxy: 1, type: "abort", request: 99 });
-		raw.send({ operationProxy: 1, type: "invoke", request: 2, invocation: "1791540000000-0123456789abcdee", host: "host-a", service: "fixture", operation: "echo", input: "y", deadline: c.deadline(0, 1000, 50), repeat: false, aborted: false });
+		raw.send({ operationProxy: 1, type: "invoke", request: 2, invocation: "1791540000000-0123456789abcdee", host: "host-a", service: "fixture", operation: "echo", input: "y", deadline: c.deadline(0, 1000, 50), repeat: false, aborted: false, parts: false });
 		await until(() => raw.lines.length === 3, "the next end on the same connection");
 		assert.equal(raw.lines[2].ending.answer, "y");
 		assert.ok(!raw.closed(), "the aborts changed nothing and closed nothing");
@@ -124,7 +131,7 @@ test("PX4: one connection carries invocations at once, their ends in any order p
 
 /** An invoke for a raw connection, with fields given. */
 function rawInvoke(c, fields = {}) {
-	return { operationProxy: 1, type: "invoke", request: 1, invocation: "1791540000000-0123456789abcdef", host: "host-a", service: "fixture", operation: "echo", input: "x", deadline: c.deadline(0, 1000, 50), repeat: false, aborted: false, ...fields };
+	return { operationProxy: 1, type: "invoke", request: 1, invocation: "1791540000000-0123456789abcdef", host: "host-a", service: "fixture", operation: "echo", input: "x", deadline: c.deadline(0, 1000, 50), repeat: false, aborted: false, parts: false, ...fields };
 }
 
 test("PX4: a line of exactly 16785408 bytes with its newline is read; one byte longer, one that does not parse, and one that breaks the table each close the connection", { timeout: 60_000 }, async () => {
@@ -853,7 +860,7 @@ test("PX5: a find of 100 ms whose later page is handed on with 80 ms gone: its t
 	});
 });
 
-test("PX5, PX6: an abort before the send is admitted ends not-delivered with agpCode ABORTED; one after changes nothing; the client half alone never ends on an abort", async () => {
+test("PX5, PX6: an abort before the send is admitted ends not-delivered with agpCode ABORTED; one after reaches the host as a cancel and the operation's own end then decides; the client half alone never ends on an abort", async () => {
 	await withCase({}, async (c) => {
 		const before = new AbortController();
 		before.abort();
@@ -868,6 +875,7 @@ test("PX5, PX6: an abort before the send is admitted ends not-delivered with agp
 		afterwards.abort();
 		await until(() => c.calls[1].abortedAt !== undefined, "the abort relayed to the proxy's call");
 		assert.deepEqual(c.hop.sent("abort"), [{ operationProxy: 1, type: "abort", request: 2 }]);
+		await until(() => c.a.runs.find((r) => r.operation === "hold")?.aborted === true, "the cancel to reach the host (EM12; D4-E6)");
 		await settle();
 		assert.ok(!call.settled(), "the abort ends nothing by itself");
 		c.a.holds[0].release();
@@ -877,7 +885,7 @@ test("PX5, PX6: an abort before the send is admitted ends not-delivered with agp
 	});
 });
 
-test("PX5: an abort crossing the hop while the send is held for admission decides as it arrives: before admission not-delivered ABORTED, after admission nothing", async () => {
+test("PX5: an abort crossing the hop while the send is held for admission decides as it arrives: before admission not-delivered ABORTED, after admission a cancel to the host, the operation's own end deciding", async () => {
 	await withTransit({}, async (c) => {
 		const release = c.hooks.holdExecutor("proxy");
 		const controller = new AbortController();
@@ -906,11 +914,12 @@ test("PX5: an abort crossing the hop while the send is held for admission decide
 		t.aborts.shift()();
 		await until(() => c.calls[0].abortedAt !== undefined, "the abort, arriving after admission, fired the call's signal");
 		await until(() => c.a.holds.length === 1, "the operation runs");
+		await until(() => c.a.runs[0]?.aborted === true, "the cancel, sent once admitted, to reach the host (EM12; D4-E6)");
 		await settle();
 		assert.ok(!call.settled(), "nothing ended the call");
 		c.a.holds[0].release();
 		await until(call.settled, "the answer");
-		assert.equal(call.value().ending, "answered", "an abort arriving after admission changes nothing");
+		assert.equal(call.value().ending, "answered", "the operation, which ignores its signal, ends the call as it ends");
 		sameAsDirect(call.value(), c.calls[0], "an abort arriving after admission");
 	});
 });
@@ -1152,21 +1161,27 @@ after(async () => { for (const f of fixtures) await f.cleanup(); });
 /**
  * A client half in this process whose proxy is the fixture application's, a real child process launched on
  * demand as the machine adapter launches it; every message it reads is recorded, with the moment it was read
- * on CLOCK_MONOTONIC.
+ * on CLOCK_MONOTONIC, and every message it writes.
  */
 function processClient(options = {}) {
 	const f = fixture(options);
 	fixtures.push(f);
 	const read = [];
+	const wrote = [];
 	const launch = { command: process.execPath, args: [PROXY_MAIN, f.configFile] };
 	const client = createProxyClient({
 		key: f.config.key, clock: machineClock, identities: machineIdentities,
 		connector: {
-			connect: (handlers) => connectChannel(f.socketPath(), { message: (value) => { read.push({ at: process.hrtime.bigint(), value }); handlers.message(value); }, closed: () => handlers.closed() }),
+			async connect(handlers) {
+				const outcome = await connectChannel(f.socketPath(), { message: (value) => { read.push({ at: process.hrtime.bigint(), value }); handlers.message(value); }, closed: () => handlers.closed() });
+				if (outcome.kind !== "connected") return outcome;
+				const link = outcome.link;
+				return { kind: "connected", link: { write: (message) => { wrote.push(message); return link.write(message); }, close: () => link.close(), hold: (keep) => link.hold(keep) } };
+			},
 			launch: () => spawn(launch.command, launch.args, { detached: true, stdio: "ignore" }).unref(),
 		},
 	});
-	return { f, client, read, call: (request) => client.invoke({ host: "host-a", service: "fixture", input: {}, bound: 30_000, ...request }) };
+	return { f, client, read, wrote, call: (request) => client.invoke({ host: "host-a", service: "fixture", input: {}, bound: 30_000, ...request }) };
 }
 
 /** The pid of the proxy serving a process client, once prepared. */
@@ -1487,4 +1502,455 @@ test("D2-E4, PX4, PX5, PX6, PX9, D54, D55: src/call-checks.ts is removed; CallRe
 	}
 	assert.equal(getters, 0, "zero getters or non-native thenables invoked");
 	assert.deepEqual(unhandled, [], "zero unhandled rejections");
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Answers in parts and cancelling across the hop (PX4 to PX6; zorg's Delta 4, stage 6, D4-E6, amendment 4).
+
+/** The proxy's writes of one type to the client, in order, as the outbound tap saw them. */
+const writtenToClient = (c, type) => c.wire.filter((w) => w.to === "client" && w.message?.type === type).map((w) => w.message);
+
+/** Writes a message straight onto the client's connection from the proxy's side of the socket, as a proxy breaking the table would. */
+const inject = (c, message) => c.hop.proxyLinks.at(-1).write(message);
+
+/** True when a value and everything in it is frozen. */
+const deeplyFrozen = (value) => value === null || typeof value !== "object" || (Object.isFrozen(value) && Object.values(value).every(deeplyFrozen));
+
+/** An outbound tap passing, dropping or holding the proxy's own `alive` messages; a held one is written on `release`. */
+function aliveTap(mode = "pass") {
+	const tap = {
+		mode,
+		held: [],
+		outbound(message, write) {
+			if (message.type !== "alive" || tap.mode === "pass") return write();
+			if (tap.mode === "hold") tap.held.push(write);
+		},
+		release() {
+			for (const write of tap.held.splice(0)) write();
+		},
+	};
+	return tap;
+}
+
+/**
+ * Advances the hop's clock by `ms` in steps of `by`, letting the socket and AGP carry what each step started, as
+ * time passing does; one advance of the whole runs every timer due before any message crosses.
+ */
+async function pass(c, ms, by = 25) {
+	for (let left = ms; left > 0; left -= by) {
+		c.clock.advance(Math.min(by, left));
+		await settle(10);
+	}
+}
+
+/** The ending the client half gives when its own deadline passes first. */
+const stalled = (ending, operation) => ({ ending: "unknown", invocation: ending.invocation, attempt: null, operation, reason: "hop-stalled", agpCode: null, deliveryReport: null });
+
+test("PX4, PX5 (D4-E6): parts is written true exactly when onPart is given; each part arrives in order, given to onPart deeply frozen and synchronously as it is read, every one before the end", async () => {
+	const parts = [];
+	const atRead = [];
+	const connect = (base) => ({
+		connect: (handlers) => base.connect({ message: (value) => { handlers.message(value); if (value?.type === "part") atRead.push(parts.length); }, closed: () => handlers.closed() }),
+		launch: () => base.launch(),
+	});
+	await withCase({ connect }, async (c) => {
+		const answers = ["a", { b: [1, { c: true }] }, 3];
+		const ending = await c.ended({ operation: "stream", input: { parts: answers }, onPart: (p) => { parts.push(p); } });
+		assert.deepEqual(c.invokes().map((i) => i.parts), [true], "written with parts true");
+		assert.deepEqual(parts.map((p) => [p.sequence, p.answer]), answers.map((a, i) => [i + 1, a]), "each part, in order, from 1");
+		assert.deepEqual(atRead, [1, 2, 3], "each part given to onPart within the read that took it");
+		assert.ok(parts.every(deeplyFrozen), "each part deeply frozen");
+		assert.deepEqual(writtenToClient(c, "part").map((m) => [m.request, m.sequence, m.answer]), answers.map((a, i) => [1, i + 1, a]));
+		assert.equal(c.wire.filter((w) => w.to === "client" && w.message.request === 1).at(-1).message.type, "end", "the end follows every part");
+		assert.deepEqual(ending.answer, { sent: 3, results: [true, true, true] });
+		sameAsDirect(ending, c.calls[0], "an answer in parts");
+		assert.equal(typeof c.calls[0].call.onPart, "function", "the proxy's call was given an onPart");
+		const whole = await c.ended({ operation: "echo", input: "whole" });
+		assert.equal(c.invokes()[1].parts, false, "written with parts false without onPart");
+		assert.equal(c.calls[1].call.onPart, undefined, "and its call given none");
+		assert.equal(whole.answer, "whole");
+	});
+});
+
+test("PX5 (D4-E6): the proxy writes alive at half its call's bound without parts, counted on from each part and alive it wrote, one from a timer that woke late, and none once the call's ending is sent", async () => {
+	await withCase({}, async (c) => {
+		const controller = new AbortController();
+		const call = watch(c.call({ operation: "drip", input: { count: 1 }, bound: 1000, onPart: () => undefined, signal: controller.signal }));
+		await until(() => c.a.holds.length === 1, "the drip runs");
+		assert.equal(c.calls[0].bound, 950, "the proxy's call bound 950, so its alive every 475");
+		c.clock.advance(474);
+		await settle();
+		assert.equal(writtenToClient(c, "alive").length, 0);
+		c.clock.advance(1);
+		await settle();
+		assert.deepEqual(writtenToClient(c, "alive"), [{ operationProxy: 1, type: "alive", request: 1 }], "at 475");
+		c.clock.advance(125);
+		c.a.holds[0].release();
+		await until(() => writtenToClient(c, "part").length === 1, "a part written at 600");
+		c.clock.advance(474);
+		await settle();
+		assert.equal(writtenToClient(c, "alive").length, 1, "none at 950: the part at 600 counted as written");
+		c.clock.advance(1);
+		await settle();
+		assert.equal(writtenToClient(c, "alive").length, 2, "at 1075, half the call's bound after the part");
+		// Its timer held 125 ms past the next alive, at 1550, it wakes at 1675 and writes one, counting on from it.
+		c.clock.move(600);
+		c.clock.advance(0);
+		await settle();
+		assert.equal(writtenToClient(c, "alive").length, 3, "the timer that woke late writes one");
+		c.clock.advance(474);
+		await settle();
+		assert.equal(writtenToClient(c, "alive").length, 3);
+		c.clock.advance(1);
+		await settle();
+		assert.equal(writtenToClient(c, "alive").length, 4, "counted on from the late one");
+		assert.ok(!call.settled(), "the proxy's alive kept the invocation past twice its bound");
+		controller.abort();
+		await until(call.settled, "the cancelled call to end");
+		assert.deepEqual(call.value().answer, { cancelled: true });
+		const after = writtenToClient(c, "alive").length;
+		c.clock.advance(5000);
+		await settle();
+		assert.equal(writtenToClient(c, "alive").length, after, "none once the call's ending is sent");
+	});
+});
+
+test("PX5 (D4-E6): for a call bound of 1 ms the proxy writes alive at 1 ms", async () => {
+	await withCase({ allowanceMs: 0 }, async (c) => {
+		const call = watch(c.call({ operation: "quiet", bound: 1, onPart: () => undefined }));
+		await until(() => c.a.runs.length === 1, "the call runs");
+		assert.equal(c.calls[0].bound, 1);
+		c.clock.advance(1);
+		await settle();
+		assert.deepEqual(writtenToClient(c, "alive"), [{ operationProxy: 1, type: "alive", request: 1 }], "an alive at 1 ms");
+		await until(call.settled, "the call to end");
+	});
+});
+
+test("PX5, PX6 (D4-E6): the client half's deadline is moved by each part and alive read before it, one read just before it taken, and not by one read exactly at or after it with its timer held, which ends the invocation hop-stalled, one abort written", async () => {
+	await withCase({ outbound: aliveTap("drop").outbound }, async (c) => {
+		const parts = [];
+		const call = watch(c.call({ operation: "hold", bound: 1000, onPart: (p) => { parts.push(p); } }));
+		await until(() => c.a.holds.length === 1, "the call runs");
+		await pass(c, 600);
+		inject(c, { operationProxy: 1, type: "alive", request: 1 });
+		await settle();
+		await pass(c, 399);
+		assert.ok(!call.settled(), "at 999 the invocation waits");
+		inject(c, { operationProxy: 1, type: "part", request: 1, sequence: 1, answer: "one" });
+		await settle();
+		assert.deepEqual(parts.map((p) => p.answer), ["one"], "the part read at 999 taken");
+		await pass(c, 999);
+		assert.ok(!call.settled(), "at 1998 the part read at 999 holds it");
+		c.clock.advance(1);
+		await until(call.settled, "the deadline at 1999");
+		assert.deepEqual(call.value(), stalled(call.value(), "hold"));
+		await until(() => c.hop.sent("abort").length === 1, "the abort written as it stalled");
+		await settle();
+		assert.deepEqual(c.hop.sent("abort"), [{ operationProxy: 1, type: "abort", request: 1 }], "one abort");
+	});
+	for (const [what, at] of [["exactly at", 1000], ["after", 1300]]) {
+		for (const type of ["alive", "part"]) {
+			await withCase({ outbound: aliveTap("drop").outbound }, async (c) => {
+				const parts = [];
+				const call = watch(c.call({ operation: "hold", bound: 1000, onPart: (p) => { parts.push(p); } }));
+				await until(() => c.a.holds.length === 1, "the call runs");
+				c.clock.move(at);
+				inject(c, type === "part" ? { operationProxy: 1, type, request: 1, sequence: 1, answer: "late" } : { operationProxy: 1, type, request: 1 });
+				await until(call.settled, `${type} read ${what} the deadline`);
+				assert.deepEqual(call.value(), stalled(call.value(), "hold"), `a ${type} read ${what} the deadline, its timer held, loses to it`);
+				assert.equal(parts.length, 0, "and is not given to onPart");
+				c.clock.advance(0);
+				await until(() => c.hop.sent("abort").length === 1, "one abort");
+			});
+		}
+	}
+});
+
+test("PX5 (D4-E6, amendment 4): an abort read before an alive the proxy already wrote leaves the invocation to end as the proxy's call ends, past the deadline it had at the abort, the alive moving it to a bound after the abort", async () => {
+	const tap = aliveTap("hold");
+	await withCase({ outbound: tap.outbound }, async (c) => {
+		const controller = new AbortController();
+		const call = watch(c.call({ operation: "hold", bound: 1000, onPart: () => undefined, signal: controller.signal }));
+		await until(() => c.a.holds.length === 1, "the call runs");
+		c.clock.advance(475);
+		await settle();
+		assert.equal(tap.held.length, 1, "the proxy wrote its alive at 475, held in transit");
+		controller.abort();
+		await until(() => c.calls[0].abortedAt !== undefined, "the abort to reach the proxy's call");
+		await until(() => c.a.runs[0].aborted === true, "its cancel to reach the host");
+		tap.mode = "pass";
+		tap.release();
+		await settle();
+		c.clock.advance(524);
+		await settle();
+		assert.ok(!call.settled(), "at 999 the invocation waits");
+		c.clock.advance(1);
+		await settle();
+		assert.ok(!call.settled(), "at 1000, its deadline at the abort, it still waits: the alive read after the abort moved it to 1475");
+		c.clock.advance(474);
+		await until(call.settled, "the proxy's call to end");
+		assert.equal(call.value().reason, "bound-passed", "ended as the proxy's call ended, never hop-stalled");
+		sameAsDirect(call.value(), c.calls[0], "a cancelled call through a working hop");
+		assert.ok(c.calls[0].endedAt > c.clock.start + ns(1000), "the proxy's call ended after the deadline the client half had at the abort");
+	});
+});
+
+test("PX5 (D4-E6, amendment 4): after an abort the proxy keeps writing alive and its call never ends: the invocation ends hop-stalled exactly one bound after the abort, its one abort written as the signal fired", async () => {
+	await withCase({ wrapCaller: () => ({ invoke: () => new Promise(() => undefined) }) }, async (c) => {
+		const controller = new AbortController();
+		const call = watch(c.call({ operation: "quiet", bound: 1000, onPart: () => undefined, signal: controller.signal }));
+		await until(() => c.invokes().length === 1, "the invocation written");
+		await settle();
+		c.clock.advance(300);
+		controller.abort();
+		await until(() => c.hop.sent("abort").length === 1, "the abort written");
+		await pass(c, 999);
+		assert.ok(writtenToClient(c, "alive").length >= 2, "the proxy kept writing alive");
+		assert.ok(!call.settled(), "at 1299 the invocation waits");
+		c.clock.advance(1);
+		await until(call.settled, "the deadline a bound after the abort");
+		assert.deepEqual(call.value(), stalled(call.value(), "quiet"));
+		await settle();
+		assert.equal(c.hop.sent("abort").length, 1, "no second abort");
+	});
+});
+
+test("PX5, PX6 (D4-E6): the proxy's alive held in transit past the client half's deadline, and in turn its timer woken late past it, ends the invocation hop-stalled there; the alive read later and the proxy's later ending are discarded, the connection kept", async () => {
+	const tap = aliveTap("hold");
+	await withCase({ outbound: tap.outbound }, async (c) => {
+		const call = watch(c.call({ operation: "hold", bound: 1000, onPart: () => undefined }));
+		await until(() => c.a.holds.length === 1, "the call runs");
+		await pass(c, 1000);
+		await until(call.settled, "the deadline at 1000");
+		const ending = call.value();
+		assert.deepEqual(ending, stalled(ending, "hold"));
+		tap.mode = "pass";
+		tap.release();
+		c.a.holds[0].release();
+		await until(() => writtenToClient(c, "end").length === 1, "the proxy's later ending");
+		await settle();
+		assert.equal(call.count(), 1);
+		assert.equal(call.value(), ending, "unchanged");
+		assert.equal((await c.ended({ operation: "echo", input: "next" })).answer, "next", "the connection kept");
+		assert.equal(c.hop.sent("hello").length, 1);
+	});
+	await withCase({}, async (c) => {
+		const call = watch(c.call({ operation: "hold", bound: 1000, onPart: () => undefined }));
+		await until(() => c.a.holds.length === 1, "the call runs");
+		c.clock.move(1100);
+		c.clock.advance(0);
+		await until(call.settled, "the deadline, its timer and the proxy's alive timer woken late together");
+		assert.deepEqual(call.value(), stalled(call.value(), "hold"));
+		await until(() => writtenToClient(c, "alive").length >= 1, "the alive the late timer wrote");
+		await settle();
+		assert.equal(call.count(), 1, "the alive read after the deadline discarded");
+		assert.equal((await c.ended({ operation: "echo", input: "next" })).answer, "next", "the connection kept");
+	});
+});
+
+test("PX5 (D4-E6): an abort after admission reaches the host as a cancel for a call in parts, which ends as the operation then ends; an abort after the ending writes nothing", async () => {
+	await withCase({}, async (c) => {
+		const controller = new AbortController();
+		const call = watch(c.call({ operation: "quiet", bound: 1000, onPart: () => undefined, signal: controller.signal }));
+		await until(() => c.a.runs.length === 1, "the call runs");
+		controller.abort();
+		await until(() => c.a.runs[0].aborted === true, "the cancel to reach the host");
+		await until(call.settled, "the ending");
+		assert.deepEqual(call.value().answer, { cancelled: true });
+		sameAsDirect(call.value(), c.calls[0], "a cancelled call in parts");
+		assert.equal(c.hop.sent("abort").length, 1);
+		const late = new AbortController();
+		const ended = await c.ended({ operation: "stream", input: { parts: ["x"] }, onPart: () => undefined, signal: late.signal });
+		assert.equal(ended.ending, "answered");
+		late.abort();
+		await settle();
+		assert.equal(c.hop.sent("abort").length, 1, "no abort after the ending");
+	});
+});
+
+test("PX5, PX6 (D4-E6): a client half that closes its connection writes no abort; the proxy aborts its call in parts, cancelled at the host, while its whole call is finished as before", async () => {
+	await withCase({}, async (c) => {
+		const parts = watch(c.call({ operation: "quiet", bound: 1000, onPart: () => undefined }));
+		const whole = watch(c.call({ operation: "hold", bound: 1000 }));
+		await until(() => c.a.runs.length === 2, "both calls run");
+		c.client.close();
+		await until(() => parts.settled() && whole.settled(), "both end");
+		assert.equal(parts.value().reason, "proxy-lost");
+		assert.equal(whole.value().reason, "proxy-lost");
+		await until(() => c.a.runs.find((r) => r.operation === "quiet").aborted === true, "the call in parts cancelled at the host");
+		await settle();
+		assert.equal(c.a.runs.find((r) => r.operation === "hold").aborted, false, "the whole call left to finish");
+		assert.equal(c.hop.sent("abort").length, 0, "no abort written");
+	});
+});
+
+test("PX5 (D4-E6): the proxy's alive stops once its call's ending is dropped, the caller's result malformed", async () => {
+	let settleWith;
+	await withCase({ wrapCaller: () => ({ invoke: () => new Promise((resolve) => { settleWith = resolve; }) }) }, async (c) => {
+		const call = watch(c.call({ operation: "quiet", bound: 1000, onPart: () => undefined }));
+		await until(() => settleWith !== undefined, "the proxy's call made");
+		c.clock.advance(475);
+		await settle();
+		assert.equal(writtenToClient(c, "alive").length, 1);
+		settleWith({ not: "an ending" });
+		await settle();
+		await pass(c, 950);
+		assert.equal(writtenToClient(c, "alive").length, 1, "no alive once the ending is dropped");
+		await pass(c, 100);
+		await until(call.settled, "the client half's deadline");
+		assert.deepEqual(call.value(), stalled(call.value(), "quiet"));
+		assert.equal(writtenToClient(c, "end").length, 0, "nothing sent for the malformed result");
+	});
+});
+
+test("PX4, PX6 (D4-E6): a part out of order, a part and an alive for a request written with parts false, for one never written and for one whose end was read, each close the connection; every invocation on it still undecided ends proxy-lost, the parts given standing", async () => {
+	const cases = [
+		["a part out of order", true, (c) => { inject(c, { operationProxy: 1, type: "part", request: 1, sequence: 1, answer: "one" }); inject(c, { operationProxy: 1, type: "part", request: 1, sequence: 3, answer: "three" }); }, ["one"]],
+		["a part for a request written with parts false", false, (c) => inject(c, { operationProxy: 1, type: "part", request: 1, sequence: 1, answer: "x" }), []],
+		["an alive for a request written with parts false", false, (c) => inject(c, { operationProxy: 1, type: "alive", request: 1 }), []],
+		["a part for a request never written", true, (c) => inject(c, { operationProxy: 1, type: "part", request: 99, sequence: 1, answer: "x" }), []],
+		["an alive for a request never written", true, (c) => inject(c, { operationProxy: 1, type: "alive", request: 99 }), []],
+	];
+	for (const [what, withParts, breakIt, standing] of cases) {
+		await withCase({}, async (c) => {
+			const parts = [];
+			const call = watch(c.call({ operation: "hold", bound: 1000, ...(withParts ? { onPart: (p) => { parts.push(p.answer); } } : {}) }));
+			const other = watch(c.call({ operation: "hold", bound: 1000 }));
+			await until(() => c.a.holds.length === 2, "both calls run");
+			breakIt(c);
+			await until(() => call.settled() && other.settled(), `${what}: both end`);
+			assert.deepEqual([call.value().reason, other.value().reason], ["proxy-lost", "proxy-lost"], what);
+			assert.deepEqual(parts, standing, `${what}: the parts given stand`);
+		});
+	}
+	for (const type of ["part", "alive"]) {
+		await withCase({}, async (c) => {
+			const ended = await c.ended({ operation: "stream", input: { parts: ["one"] }, onPart: () => undefined });
+			assert.equal(ended.ending, "answered");
+			const other = watch(c.call({ operation: "hold", bound: 1000 }));
+			await until(() => c.a.holds.length === 1, "another call runs");
+			inject(c, type === "part" ? { operationProxy: 1, type, request: 1, sequence: 2, answer: "late" } : { operationProxy: 1, type, request: 1 });
+			await until(other.settled, `a ${type} after its request's end: the other call ends`);
+			assert.equal(other.value().reason, "proxy-lost");
+			assert.equal(ended.ending, "answered");
+		});
+	}
+});
+
+test("PX4, PX5 (D4-E6): consecutive parts in order read for an invocation already decided are discarded, the connection kept; a part out of order read for it closes the connection, another invocation ending proxy-lost and the decided one unchanged", async () => {
+	await withCase({ outbound: aliveTap("drop").outbound }, async (c) => {
+		const parts = [];
+		const decided = watch(c.call({ operation: "hold", bound: 1000, onPart: (p) => { parts.push(p); } }));
+		const other = watch(c.call({ operation: "hold", bound: 5000 }));
+		await until(() => c.a.holds.length === 2, "both calls run");
+		await pass(c, 1000);
+		await until(decided.settled, "the first ends hop-stalled");
+		const ending = decided.value();
+		assert.equal(ending.reason, "hop-stalled");
+		inject(c, { operationProxy: 1, type: "part", request: 1, sequence: 1, answer: "late one" });
+		inject(c, { operationProxy: 1, type: "part", request: 1, sequence: 2, answer: "late two" });
+		await settle();
+		assert.equal(parts.length, 0, "late parts not given to onPart");
+		assert.ok(!other.settled(), "the connection kept");
+		inject(c, { operationProxy: 1, type: "part", request: 1, sequence: 4, answer: "out of order" });
+		await until(other.settled, "the other call to end");
+		assert.equal(other.value().reason, "proxy-lost");
+		assert.equal(decided.count(), 1);
+		assert.equal(decided.value(), ending, "the decided one unchanged");
+	});
+});
+
+test("PX6 (D4-E6): a client that reads nothing while parts are written to it has its connection closed once 33570816 bytes would be unwritten, its call cancelled at the host; an end written to it before the close is read once it reads again", { timeout: 180_000 }, async () => {
+	await withCase({}, async (c) => {
+		const raw = await rawConnection(c.hop.socketPath);
+		raw.send({ operationProxy: 1, type: "hello", key: KEY });
+		await until(() => raw.lines.length === 1, "welcome");
+		raw.pause();
+		raw.send(rawInvoke(c, { request: 1, operation: "echo", input: "written before the close" }));
+		await until(() => writtenToClient(c, "end").some((m) => m.request === 1), "the end of the first written");
+		raw.send(rawInvoke(c, { request: 2, operation: "flood", input: { n: 60, size: 1_000_000 }, parts: true, deadline: c.deadline(0, 600_000, 50) }));
+		await until(() => c.a.runs.find((r) => r.operation === "flood")?.aborted === true, "the flood cancelled at the host", 120_000);
+		const written = writtenToClient(c, "part").length;
+		assert.ok(written >= 33 && written < 60, `parts written until the bound: ${written}`);
+		raw.resume();
+		await until(() => raw.closed(), "the connection closed", 60_000);
+		assert.ok(raw.lines.some((l) => l.type === "end" && l.request === 1 && l.ending.answer === "written before the close"), "the end written before the close read");
+		assert.ok(!raw.lines.some((l) => l.type === "end" && l.request === 2), "no end of the flood");
+		assert.ok(raw.lines.filter((l) => l.type === "part").length < written, "what was unwritten at the close discarded");
+	});
+});
+
+test("PX6 (D4-E6): a client that reads steadily while more than 33570816 bytes in all are written to it keeps its connection", { timeout: 180_000 }, async () => {
+	// The proxy's call gives each part of 1 MB once the client half has taken the one before, so what is unwritten
+	// stays under a part while 50 MB in all are written.
+	let taken = 0;
+	const text = "x".repeat(1_000_000);
+	const wrapCaller = () => ({
+		async invoke(call) {
+			for (let i = 0; i < 50; i++) {
+				call.onPart({ sequence: i + 1, answer: { i, text } });
+				await until(() => taken === i + 1, `part ${i + 1} taken`, 60_000);
+			}
+			return { ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000001`, operation: call.operation, answer: { sent: 50 } };
+		},
+	});
+	await withCase({ wrapCaller }, async (c) => {
+		const ending = await c.ended({ operation: "flood", bound: 600_000, onPart: () => { taken++; } });
+		assert.deepEqual(ending.answer, { sent: 50 });
+		assert.equal(taken, 50, "every part given");
+		assert.equal(writtenToClient(c, "part").length, 50);
+		assert.equal(c.hop.sent("hello").length, 1, "one connection throughout");
+	});
+});
+
+test("PX6 (D4-E6, processes): a proxy stopped with SIGSTOP during a quiet invocation in parts ends it hop-stalled one bound after its last sign of life, its abort written, and after SIGCONT the call is ended at the host", { timeout: 90_000 }, async () => {
+	const p = processClient();
+	const pid = await servingPid(p);
+	const call = watch(p.call({ operation: "quiet", bound: 3000, onPart: () => undefined }));
+	await waitFor(() => p.f.runs().some((r) => r.operation === "quiet"), "the invocation to reach the host");
+	const attempt = p.f.runs().find((r) => r.operation === "quiet").attempt;
+	const request = p.wrote.find((m) => m.type === "invoke" && m.operation === "quiet").request;
+	await waitFor(() => p.read.some((r) => r.value.type === "alive" && r.value.request === request), "a sign of life from the proxy", 20_000);
+	process.kill(pid, "SIGSTOP");
+	try {
+		await until(call.settled, "the ending", 30_000);
+		const decided = process.hrtime.bigint();
+		const lastSign = p.read.filter((r) => r.value.request === request && (r.value.type === "alive" || r.value.type === "part")).at(-1).at;
+		const ms = Number(decided - lastSign) / 1e6;
+		assert.deepEqual(call.value(), { ending: "unknown", invocation: call.value().invocation, attempt: null, operation: "quiet", reason: "hop-stalled", agpCode: null, deliveryReport: null });
+		assert.ok(ms >= 2990 && ms < 4500, `one bound after the last sign of life: ${Math.round(ms)} ms`);
+		assert.deepEqual(p.wrote.filter((m) => m.type === "abort"), [{ operationProxy: 1, type: "abort", request }], "its one abort written");
+		process.kill(pid, "SIGCONT");
+		await waitFor(() => p.f.aborts().some((a) => a.attempt === attempt), "the call ended at the host after SIGCONT", 20_000);
+	} finally {
+		try { process.kill(pid, "SIGCONT"); } catch { /* gone */ }
+	}
+	p.client.close();
+});
+
+test("PX6 (D4-E6, processes): a proxy killed during an invocation in parts ends it unknown with proxy-lost at once, the parts already taken standing", { timeout: 60_000 }, async () => {
+	const p = processClient();
+	const pid = await servingPid(p);
+	const parts = [];
+	const call = watch(p.call({ operation: "drip", input: { count: 2 }, onPart: (part) => { parts.push(part); } }));
+	await until(() => parts.length === 2, "two parts taken", 20_000);
+	const killed = process.hrtime.bigint();
+	process.kill(pid, "SIGKILL");
+	await until(call.settled, "the ending", 10_000);
+	const ms = Number(process.hrtime.bigint() - killed) / 1e6;
+	assert.equal(call.value().reason, "proxy-lost");
+	assert.ok(ms < 5000, `at once, not at the bound: ${Math.round(ms)} ms`);
+	assert.deepEqual(parts.map((x) => [x.sequence, x.answer]), [[1, { drip: 1 }], [2, { drip: 2 }]], "the parts taken stand");
+	p.client.close();
+});
+
+test("PX6 (D4-E6, processes): a client killed during an invocation in parts leaves its call cancelled at the host", { timeout: 60_000 }, async () => {
+	const f = fixture();
+	fixtures.push(f);
+	const c = f.client({ operation: "quiet", parts: true, bound: 30_000, connectMs: 20_000 });
+	await waitFor(() => f.runs().some((r) => r.operation === "quiet"), "the invocation to reach the host");
+	const attempt = f.runs().find((r) => r.operation === "quiet").attempt;
+	c.child.kill("SIGKILL");
+	await waitFor(() => f.aborts().some((a) => a.attempt === attempt), "the call cancelled at the host", 20_000);
 });

@@ -7,6 +7,11 @@
  * half that finds it does not closes the connection too. A link reports its closing once, whichever side
  * closed it. Nothing here listens on the network: the socket is a path in the runtime directory, reached
  * only as the host's own access rules on it allow.
+ *
+ * On the proxy's side a link keeps at most `maxUnwrittenBytes` unwritten - what it handed the socket that the
+ * operating system has not yet taken - and a message whose writing would exceed that is not written: the
+ * connection is closed at once, what it held unwritten discarded (PX6). What the operating system had already
+ * taken still reaches the other side.
  */
 import net from "node:net";
 import type { ChannelLink, LinkHandlers } from "./channel-link.js";
@@ -15,8 +20,15 @@ import type { ConnectOutcome } from "./client-preparing.js";
 
 const NEWLINE = 0x0a;
 
+/** What a link over a socket keeps to. */
+export interface SocketLinkOptions {
+	/** The most it keeps unwritten; a write that would exceed it closes the connection at once (PX6). */
+	readonly maxUnwrittenBytes?: number;
+}
+
 /** A link over a connected socket, its messages and its closing reported to the handlers. */
-export function socketLink(socket: net.Socket, handlers: LinkHandlers): ChannelLink {
+export function socketLink(socket: net.Socket, handlers: LinkHandlers, options: SocketLinkOptions = {}): ChannelLink {
+	const maxUnwritten = options.maxUnwrittenBytes;
 	let reported = false;
 	let reading = true;
 	let pending: Buffer[] = [];
@@ -67,7 +79,14 @@ export function socketLink(socket: net.Socket, handlers: LinkHandlers): ChannelL
 	return Object.freeze({
 		write(message: ChannelMessage): boolean {
 			if (reported || socket.destroyed || !socket.writable) return false;
-			socket.write(`${JSON.stringify(message)}\n`);
+			const line = `${JSON.stringify(message)}\n`;
+			if (maxUnwritten !== undefined && socket.writableLength + Buffer.byteLength(line, "utf8") > maxUnwritten) {
+				// Not written: the connection is closed at once, what it held unwritten discarded (PX6).
+				reading = false;
+				socket.destroy();
+				return false;
+			}
+			socket.write(line);
 			return true;
 		},
 		close(): void {

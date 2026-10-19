@@ -65,6 +65,8 @@ export function fixture(options = {}) {
 		stages: () => readRecords(path.join(records, "stages.ndjson")),
 		/** Every run the fixture host recorded. */
 		runs: () => readRecords(path.join(records, "runs.ndjson")),
+		/** Every run whose signal fired at the fixture host, a cancel among the causes. */
+		aborts: () => readRecords(path.join(records, "aborts.ndjson")),
 		/** The process ids that took ownership. */
 		owners: () => f.stages().filter((s) => s.stage === "owned").map((s) => s.pid),
 		/** The processes that started as proxies. */

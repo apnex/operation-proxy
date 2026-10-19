@@ -2,11 +2,22 @@
 // reaching a SharedWorker named `operation-proxy:<digest>` over one MessagePort per page, carrying PX4's
 // messages as plain objects with relative millisecond `deadline` across independent page and worker clocks and
 // 5-second `ping` / 15-second liveness heartbeats.
+//
+// Answers in parts and cancelling (zorg's Delta 4, stage 6, D4-E6): the caller suite's rows `answer-in-parts` and
+// `cancel-invocation` run through the browser adapter over a real MessageChannel, the worker's caller
+// operation-call's own (PX10); and on a rig whose page side holds or drops what the worker posts, `taken` is
+// matched in order across a request's parts and `alive` messages before and after its `end`, a `taken` matching
+// nothing or naming another `sequence` closes the port, and a page taking parts, or only `alive` messages, more
+// slowly than they are posted has its port closed once 33570816 bytes would be posted and not taken, its call
+// cancelled, while a page taking each part in time keeps its port through more than that in all (PX8).
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { keyDigest } from "@apnex/operation-proxy";
 import { createBrowserClient, runBrowserProxy } from "@apnex/operation-proxy/browser";
 import { machineIdentities } from "../../dist/machine-clock-adapter.js";
+import { registerCallerSuite } from "@apnex/operation-call/caller-suite";
+import { CHANNEL_LIMITS } from "@apnex/operation-proxy";
+import { browserHarness } from "../support/browser-harness.js";
 import { settle, until, watch } from "../support/case-hop.js";
 import { KEY } from "../support/hop.js";
 import { createManualHopClock, ns } from "../support/manual-hop-clock.js";
@@ -659,4 +670,222 @@ describe("PX8 - browser adapter (@apnex/operation-proxy/browser, D3-E3)", () => 
 		defaultClient.close();
 		defaultProxy.close();
 	});
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Answers in parts and cancelling through the browser adapter (PX8, PX10; zorg's Delta 4, stage 6, D4-E6).
+
+registerCallerSuite((name, run) => test(`D4-E6, through the browser adapter, an allowance of 50 ms: ${name}`, { timeout: 120_000 }, run), browserHarness({ allowanceMs: 50 }), ["answer-in-parts", "cancel-invocation"]);
+
+/**
+ * A page and a worker on one manual clock, joined by an in-memory port pair: what the worker posts reaches the
+ * page a turn later unless the case holds it (`hold`, released by `release`) or drops it (`drop`), each by type;
+ * what the page posts reaches the worker a turn later, recorded. Closing one port closes neither the other nor what
+ * was already posted to it. The worker's caller is the case's: each call is recorded with `part(answer)`, which
+ * gives the next part to its `onPart`, and `end(answer)`, which answers it.
+ */
+function partsRig({ hopAllowanceMs = 50 } = {}) {
+	const clock = createManualHopClock();
+	const calls = [];
+	const toWorker = [];
+	const toPage = [];
+	const held = [];
+	const policy = { hold: new Set(), drop: new Set() };
+	let workerClosed = false;
+	let pageClosed = false;
+	const pageListeners = new Set();
+	const workerListeners = new Set();
+	const turn = (fn) => setImmediate(fn);
+	const deliverToPage = (data) => {
+		if (pageClosed) return;
+		for (const fn of [...pageListeners]) fn({ data });
+	};
+	const workerPort = {
+		addEventListener: (_t, fn) => workerListeners.add(fn),
+		removeEventListener: (_t, fn) => workerListeners.delete(fn),
+		start() {},
+		close() { workerClosed = true; },
+		postMessage(data) {
+			if (workerClosed) return;
+			const copy = structuredClone(data);
+			toPage.push(copy);
+			if (policy.drop.has(copy.type)) return;
+			if (policy.hold.has(copy.type)) return void held.push(copy);
+			turn(() => deliverToPage(copy));
+		},
+	};
+	const pagePort = {
+		addEventListener: (_t, fn) => pageListeners.add(fn),
+		removeEventListener: (_t, fn) => pageListeners.delete(fn),
+		start() {},
+		close() { pageClosed = true; },
+		postMessage(data) {
+			if (pageClosed) return;
+			const copy = structuredClone(data);
+			toWorker.push(copy);
+			turn(() => { if (!workerClosed) for (const fn of [...workerListeners]) fn({ data: copy }); });
+		},
+	};
+	const caller = {
+		invoke(call) {
+			let sequence = 0;
+			let resolve;
+			const ending = new Promise((r) => { resolve = r; });
+			calls.push({
+				call,
+				part: (answer) => call.onPart({ sequence: ++sequence, answer }),
+				end: (answer) => resolve({ ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000001`, operation: call.operation, answer }),
+			});
+			return ending;
+		},
+	};
+	const proxy = runBrowserProxy({ key: KEY, buildCaller: () => ({ caller, stop: () => undefined }), callerReady: () => undefined }, { clock, scope: {} });
+	const client = createBrowserClient({ key: KEY, workerUrl: "https://example.test/worker.js", hopAllowanceMs }, {
+		clock, identities: machineIdentities, openPort() { proxy.connectPort(workerPort); return pagePort; },
+	});
+	return {
+		clock, calls, toWorker, toPage, policy, proxy, client, workerPort,
+		workerClosed: () => workerClosed,
+		/** Delivers what was held to the page, in order. */
+		release() { for (const data of held.splice(0)) turn(() => deliverToPage(data)); },
+		/** Posts a raw message to the worker, as from the page. */
+		postToWorker: (message) => pagePort.postMessage(message),
+		call: (request) => client.invoke({ host: "host-a", service: "fixture", operation: "op", input: {}, bound: 1000, ...request }),
+		close() { client.close(); proxy.close(); },
+	};
+}
+
+test("PX8 (D4-E6): the page posts taken for each part and alive it reads, matched by the worker in order across a request's parts and alive messages before and after its end; a taken matching nothing, or naming another sequence, closes the port", async () => {
+	const r = partsRig();
+	try {
+		await r.proxy.ready;
+		const parts = [];
+		const call = watch(r.call({ onPart: (p) => { parts.push(p.answer); } }));
+		await until(() => r.calls.length === 1, "the worker's call made");
+		assert.equal(r.toWorker.find((m) => m.type === "invoke").parts, true, "invoke carries parts");
+		r.policy.hold.add("part").add("alive").add("end");
+		r.calls[0].part("one");
+		r.calls[0].part("two");
+		r.clock.advance(475);
+		r.calls[0].part("three");
+		r.calls[0].end("done");
+		await settle();
+		assert.deepEqual(r.toPage.filter((m) => ["part", "alive", "end"].includes(m.type)).map((m) => m.type), ["part", "part", "alive", "part", "end"], "all posted while the page holds them");
+		r.policy.hold.clear();
+		r.release();
+		await until(call.settled, "the ending read");
+		assert.equal(call.value().answer, "done");
+		assert.deepEqual(parts, ["one", "two", "three"]);
+		await settle();
+		assert.deepEqual(r.toWorker.filter((m) => m.type === "taken"), [
+			{ operationProxy: 1, type: "taken", request: 1, sequence: 1 },
+			{ operationProxy: 1, type: "taken", request: 1, sequence: 2 },
+			{ operationProxy: 1, type: "taken", request: 1 },
+			{ operationProxy: 1, type: "taken", request: 1, sequence: 3 },
+		], "a taken for each part and alive, in order, none for the end");
+		assert.equal(r.workerClosed(), false, "each matched, after the end too");
+		const next = watch(r.call({}));
+		await until(() => r.calls.length === 2, "a second call on the same port");
+		r.calls[1].end("again");
+		await until(next.settled, "its ending");
+		assert.equal(next.value().answer, "again", "the port kept");
+	} finally {
+		r.close();
+	}
+	for (const [what, taken] of [["a taken matching nothing", { operationProxy: 1, type: "taken", request: 99 }], ["a taken naming another sequence", { operationProxy: 1, type: "taken", request: 1, sequence: 2 }], ["a taken with no sequence for a part", { operationProxy: 1, type: "taken", request: 1 }]]) {
+		const r2 = partsRig();
+		try {
+			await r2.proxy.ready;
+			watch(r2.call({ onPart: () => undefined }));
+			await until(() => r2.calls.length === 1, "the worker's call made");
+			r2.policy.drop.add("part");
+			r2.calls[0].part("unread");
+			r2.postToWorker(taken);
+			await until(r2.workerClosed, `${what}: the port closed`);
+			await until(() => r2.calls[0].call.signal.aborted, `${what}: the call in parts aborted`);
+		} finally {
+			r2.close();
+		}
+	}
+});
+
+test("PX8 (D4-E6): a page taking parts more slowly than they are posted has its port closed once 33570816 bytes would be posted and not taken, its call aborted; an end posted before the close is still read", { timeout: 120_000 }, async () => {
+	const r = partsRig();
+	try {
+		await r.proxy.ready;
+		const first = watch(r.call({}));
+		await until(() => r.calls.length === 1, "the first call made");
+		r.policy.hold.add("part").add("end");
+		r.calls[0].end("posted before the close");
+		const parts = [];
+		const flood = watch(r.call({ bound: 600_000, onPart: (p) => { parts.push(p.sequence); } }));
+		await until(() => r.calls.length === 2, "the call in parts made");
+		const text = "z".repeat(1_000_000);
+		let posted = 0;
+		for (let i = 0; i < 40 && !r.workerClosed(); i++) {
+			r.calls[1].part({ i, text });
+			if (!r.workerClosed()) posted++;
+		}
+		assert.ok(r.workerClosed(), "the port closed");
+		const partBytes = Buffer.byteLength(JSON.stringify({ operationProxy: 1, type: "part", request: 2, sequence: 1, answer: { i: 0, text } }), "utf8");
+		assert.equal(posted, Math.floor(CHANNEL_LIMITS.unwrittenBytes / partBytes), `parts posted until the next would pass ${CHANNEL_LIMITS.unwrittenBytes} bytes not taken`);
+		assert.equal(r.toPage.filter((m) => m.type === "part").length, posted, "the part that would pass it not posted");
+		await until(() => r.calls[1].call.signal.aborted, "the call in parts aborted");
+		r.policy.hold.clear();
+		r.release();
+		await until(first.settled, "the end posted before the close read");
+		assert.equal(first.value().answer, "posted before the close");
+		assert.ok(!flood.settled() || flood.value().ending === "unknown", "the call in parts never answered");
+	} finally {
+		r.close();
+	}
+});
+
+test("PX8 (D4-E6): a page taking only alive messages more slowly than they are posted, during a quiet invocation in parts, has its port closed once 33570816 bytes would be posted and not taken, its call aborted", { timeout: 300_000 }, async () => {
+	const r = partsRig();
+	try {
+		await r.proxy.ready;
+		// A raw page: it says hello, invokes with 2 ms left, and then only pings, taking no alive.
+		r.proxy.connectPort(r.workerPort);
+		r.postToWorker({ operationProxy: 1, type: "hello", key: KEY });
+		await until(() => r.toPage.some((m) => m.type === "welcome"), "welcome");
+		r.policy.drop.add("alive");
+		r.postToWorker({ operationProxy: 1, type: "invoke", request: 1, invocation: "1791540000000-0123456789abcdef", host: "host-a", service: "fixture", operation: "op", input: {}, deadline: 2, repeat: false, aborted: false, parts: true });
+		await until(() => r.calls.length === 1, "the worker's call made");
+		assert.equal(r.calls[0].call.bound, 2, "its call bound 2 ms, so an alive every 1 ms");
+		const aliveBytes = Buffer.byteLength(JSON.stringify({ operationProxy: 1, type: "alive", request: 1 }), "utf8");
+		const limit = Math.floor(CHANNEL_LIMITS.unwrittenBytes / aliveBytes);
+		for (let elapsed = 0; !r.workerClosed() && elapsed < limit + 20_000; elapsed += 5000) {
+			r.clock.advance(5000);
+			r.postToWorker({ operationProxy: 1, type: "ping" });
+			await settle(2);
+		}
+		assert.ok(r.workerClosed(), "the port closed");
+		assert.equal(r.toPage.filter((m) => m.type === "alive").length, limit, `alive messages posted until the next would pass ${CHANNEL_LIMITS.unwrittenBytes} bytes not taken`);
+		await until(() => r.calls[0].call.signal.aborted, "the call in parts aborted");
+	} finally {
+		r.close();
+	}
+});
+
+test("PX8 (D4-E6): a page taking each part in time keeps its port while more than 33570816 bytes in all are posted", { timeout: 120_000 }, async () => {
+	const r = partsRig();
+	try {
+		await r.proxy.ready;
+		const parts = [];
+		const call = watch(r.call({ bound: 600_000, onPart: (p) => { parts.push(p.sequence); } }));
+		await until(() => r.calls.length === 1, "the worker's call made");
+		const text = "w".repeat(1_000_000);
+		for (let i = 0; i < 40; i++) {
+			r.calls[0].part({ i, text });
+			await until(() => r.toWorker.filter((m) => m.type === "taken").length === i + 1, `part ${i + 1} taken`);
+		}
+		r.calls[0].end("all");
+		await until(call.settled, "the ending");
+		assert.equal(call.value().answer, "all");
+		assert.equal(parts.length, 40);
+		assert.equal(r.workerClosed(), false, "the port kept");
+	} finally {
+		r.close();
+	}
 });

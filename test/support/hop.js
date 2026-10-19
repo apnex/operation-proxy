@@ -12,7 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createCaller } from "@apnex/operation-call";
-import { callClockOf, createProxyClient, createProxyHalf } from "@apnex/operation-proxy";
+import { CHANNEL_LIMITS, callClockOf, createProxyClient, createProxyHalf } from "@apnex/operation-proxy";
 import { connectChannel, listenChannel, socketLink } from "../../dist/machine-channel-adapter.js";
 import { machineIdentities } from "../../dist/machine-clock-adapter.js";
 import { openTopology } from "./topology.js";
@@ -30,6 +30,7 @@ export function shortTempDir(prefix = "opx-") {
  * client half's hop allowance (default 50); holdDeliveryReports; idleMs and onIdle for the proxy half; readiness, a promise the proxy
  * awaits before its caller is ready; inbound and outbound taps; connect, a wrapper of the client's connector;
  * wrapCaller, a wrapper of the proxy's recording caller, for a case whose proxy's caller misbehaves.
+ * maxUnwrittenBytes, the most the proxy side keeps unwritten on a connection, PX6's 33570816 bytes by default.
  */
 export async function openHop(options) {
 	const clock = options.clock;
@@ -59,7 +60,7 @@ export async function openHop(options) {
 		const link = socketLink(socket, {
 			message: (value) => { wire.push({ to: "proxy", message: value }); inbound(value, () => handlers.message(value)); },
 			closed: () => handlers.closed(),
-		});
+		}, { maxUnwrittenBytes: options.maxUnwrittenBytes ?? CHANNEL_LIMITS.unwrittenBytes });
 		proxyLinks.push(link);
 		handlers = half.accept({
 			write: (message) => { let ok = true; outbound(message, () => { wire.push({ to: "client", message }); ok = link.write(message); }); return ok; },

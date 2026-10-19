@@ -7,7 +7,10 @@
 // channel socket, a failed close of the channel's server and of ownership, an observer throwing at each stage,
 // a clock reading or timer failing at each point of starting, and a caller that fails to stop, each asserting the status, that every later step ran, that no server is left
 // listening, and that a later start in the same process owns the key - and - marked "(processes)" - one
-// real proxy process with an idle time of 1 second, and a real client that returns from its program.
+// real proxy process with an idle time of 1 second, and a real client that returns from its program. Stopping
+// with an invocation in parts in flight (zorg's Delta 4, stage 6, D4-E6): its call cancelled, an invoke read after
+// answered `proxy-stopping`, two connections unread closed together within 2 seconds, the caller's stop awaited
+// however long, and a real proxy on `SIGTERM` and `SIGINT` cancelling its call in parts and exiting within one bound.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -249,7 +252,7 @@ test("stopping on request, as on SIGTERM, waits for each call in flight to end a
 	waiting.send({ operationProxy: 1, type: "hello", key });
 	readyNow.resolve();
 	await until(() => waiting.lines.length === 1, "welcome");
-	waiting.send({ operationProxy: 1, type: "invoke", request: 1, invocation: "1791540000000-0123456789abcdef", host: "h", service: "s", operation: "o", input: null, deadline: String(clock.nowNs() + 60_000_000_000n), repeat: false, aborted: false });
+	waiting.send({ operationProxy: 1, type: "invoke", request: 1, invocation: "1791540000000-0123456789abcdef", host: "h", service: "s", operation: "o", input: null, deadline: String(clock.nowNs() + 60_000_000_000n), repeat: false, aborted: false, parts: false });
 	await settle();
 	const unwelcomed = await rawConnection(socketPath);
 	await settle();
@@ -657,5 +660,136 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
 		assert.equal(f.exits().get(pid), 0);
 		assert.ok(!fs.existsSync(f.socketPath()));
 		assert.deepEqual(f.stages().filter((s) => s.pid === pid).map((s) => s.stage).slice(-5), ["stopping", "channel-closed", "caller-stopped", "stopped", "exit"]);
+	});
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Stopping with invocations in parts in flight (PX7; zorg's Delta 4, stage 6, D4-E6).
+
+/** An invoke for a raw connection to a proxy whose clock is `clock`, with fields given. */
+function rawInvoke(clock, fields) {
+	return { operationProxy: 1, type: "invoke", request: 1, invocation: "1791540000000-0123456789abcdef", host: "h", service: "s", operation: "o", input: null, deadline: String(clock.nowNs() + 60_000_000_000n), repeat: false, aborted: false, parts: false, ...fields };
+}
+
+test("stopping on request, as on SIGTERM, with an invocation in parts in flight: its call is cancelled and its ending sent, an invoke read after is answered proxy-stopping, and it stops once the whole call in flight has ended", async () => {
+	const dir = path.join(shortTempDir(), "rt");
+	const key = { application: "fixture", identity: `parts-term-${process.pid}`, target: "held" };
+	const clock = createManualHopClock();
+	const release = Promise.withResolvers();
+	const answered = (call, answer) => ({ ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000000`, operation: call.operation, answer });
+	const application = {
+		key, idleMs: 60_000,
+		buildCaller: () => ({
+			caller: {
+				invoke: (call) => call.onPart === undefined
+					? release.promise.then(() => answered(call, "whole"))
+					: new Promise((resolve) => call.signal.addEventListener("abort", () => resolve(answered(call, "cancelled")), { once: true })),
+			},
+			stop: () => undefined,
+		}),
+		callerReady: () => undefined,
+	};
+	const stages = [];
+	const proxy = await startMachineProxyIn(dir, application, { clock, observe: (s) => stages.push(s) });
+	const socketPath = path.join(dir, `${keyDigest(key)}.sock`);
+	await until(() => stages.includes("ready"), "ready");
+	const raw = await rawConnection(socketPath);
+	raw.send({ operationProxy: 1, type: "hello", key });
+	await until(() => raw.lines.length === 1, "welcome");
+	raw.send(rawInvoke(clock, { request: 1, invocation: "1791540000000-0123456789abcde1" }));
+	raw.send(rawInvoke(clock, { request: 2, invocation: "1791540000000-0123456789abcde2", parts: true }));
+	await settle();
+	proxy.stop();
+	await until(() => raw.lines.some((l) => l.type === "end" && l.request === 2), "the call in parts cancelled and its ending sent");
+	assert.equal(raw.lines.find((l) => l.type === "end" && l.request === 2).ending.answer, "cancelled");
+	raw.send(rawInvoke(clock, { request: 3, invocation: "1791540000000-0123456789abcde3", operation: "late" }));
+	await until(() => raw.lines.some((l) => l.type === "end" && l.request === 3), "the invoke after stopping answered");
+	assert.deepEqual(raw.lines.find((l) => l.request === 3).ending, { ending: "not-delivered", invocation: "1791540000000-0123456789abcde3", attempt: null, operation: "late", agpCode: null, proxyCode: "proxy-stopping", earlierAttemptsUncertain: false });
+	await settle(60);
+	assert.ok(!stages.includes("stopping"), "it waits for the whole call in flight");
+	release.resolve();
+	assert.equal(await proxy.stopped, 0);
+	assert.equal(raw.lines.find((l) => l.type === "end" && l.request === 1).ending.answer, "whole");
+	fs.rmSync(path.dirname(dir), { recursive: true, force: true });
+});
+
+test("stopping closes every welcomed connection together within 2 seconds: two clients reading nothing while their whole answers are unwritten are destroyed 2 seconds after closing began", { timeout: 60_000 }, async () => {
+	const dir = path.join(shortTempDir(), "rt");
+	const key = { application: "fixture", identity: `flush-${process.pid}`, target: "echo" };
+	const clock = createManualHopClock();
+	const application = {
+		key, idleMs: 60_000,
+		buildCaller: () => ({ caller: { invoke: async (call) => ({ ending: "answered", invocation: call.invocation, attempt: `${call.invocation}.00000000`, operation: call.operation, answer: call.input }) }, stop: () => undefined }),
+		callerReady: () => undefined,
+	};
+	const stages = [];
+	const at = {};
+	const proxy = await startMachineProxyIn(dir, application, { clock, observe: (s) => { stages.push(s); at[s] = performance.now(); } });
+	const socketPath = path.join(dir, `${keyDigest(key)}.sock`);
+	await until(() => stages.includes("ready"), "ready");
+	const big = "y".repeat(8_000_000);
+	const readers = [];
+	for (let i = 0; i < 2; i++) {
+		const raw = await rawConnection(socketPath);
+		raw.send({ operationProxy: 1, type: "hello", key });
+		await until(() => raw.lines.length === 1, "welcome");
+		raw.pause();
+		raw.send(rawInvoke(clock, { request: 1, invocation: `1791540000000-0123456789abcd0${i}`, input: big }));
+		readers.push(raw);
+	}
+	await sleep(500);
+	proxy.stop();
+	assert.equal(await proxy.stopped, 0);
+	const closingMs = at["channel-closed"] - at.stopping;
+	assert.ok(closingMs >= 1900 && closingMs < 4500, `both destroyed together about 2 seconds after closing began: ${Math.round(closingMs)} ms`);
+	for (const raw of readers) raw.resume();
+	await until(() => readers.every((raw) => raw.closed()), "both connections closed");
+	fs.rmSync(path.dirname(dir), { recursive: true, force: true });
+});
+
+test("stopping awaits the application's stop of its caller, however long, and releases ownership only after", { timeout: 60_000 }, async () => {
+	const dir = path.join(shortTempDir(), "rt");
+	const key = { application: "fixture", identity: `slow-stop-${process.pid}`, target: "quick" };
+	const stopping = Promise.withResolvers();
+	let stopCalled = false;
+	const application = {
+		key, idleMs: 60_000,
+		buildCaller: () => ({ caller: { invoke: async () => undefined }, stop: () => { stopCalled = true; return stopping.promise; } }),
+		callerReady: () => undefined,
+	};
+	const stages = [];
+	const proxy = await startMachineProxyIn(dir, application, { clock: createManualHopClock(), observe: (s) => stages.push(s) });
+	await until(() => stages.includes("ready"), "ready");
+	let status;
+	proxy.stopped.then((s) => { status = s; });
+	proxy.stop();
+	await until(() => stopCalled, "the caller's stop called");
+	await sleep(1500);
+	assert.equal(status, undefined, "not stopped while the caller's stop is pending");
+	assert.equal(await held(ownershipName(dir, keyDigest(key))), true, "ownership still held");
+	stopping.resolve();
+	await until(() => status !== undefined, "stopped once the caller's stop settled");
+	assert.equal(status, 0);
+	assert.equal(await held(ownershipName(dir, keyDigest(key))), false, "ownership released after");
+	fs.rmSync(path.dirname(dir), { recursive: true, force: true });
+});
+
+for (const signal of ["SIGTERM", "SIGINT"]) {
+	test(`(processes) on ${signal} during a quiet invocation in parts, a real proxy cancels its call at the host, sends its ending and exits within one bound`, { timeout: 60_000 }, async () => {
+		const f = fixture();
+		fixtures.push(f);
+		const c = f.client({ operation: "quiet", parts: true, bound: 5000, connectMs: 20_000 });
+		await waitFor(() => f.runs().some((r) => r.operation === "quiet"), "the call in flight");
+		const attempt = f.runs().find((r) => r.operation === "quiet").attempt;
+		const pid = f.owners()[0];
+		const signalled = performance.now();
+		process.kill(pid, signal);
+		await waitFor(() => f.aborts().some((a) => a.attempt === attempt), "the call cancelled at the host");
+		const ack = await c.ack();
+		assert.deepEqual(ack.ending.answer, { cancelled: true }, "its ending sent before it stopped");
+		await waitFor(() => !alive(pid), "the proxy to exit");
+		const ms = performance.now() - signalled;
+		assert.ok(ms < 5000, `exited within the bound of 5 s: ${Math.round(ms)} ms`);
+		assert.equal(f.exits().get(pid), 0);
 	});
 }

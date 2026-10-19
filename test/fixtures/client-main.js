@@ -4,7 +4,8 @@
 // or preparing ended it, invokes the call - and acknowledges by writing the ending, with its own process id, to the ack file, renamed into
 // place whole, which the test polls; then it closes the client half and exits, or, for a call marked `natural`,
 // simply returns. Its proxy is launched as `proxy-main.js` with the same
-// configuration, the call's `idleMs` given on the command line when it holds one (PX9).
+// configuration, the call's `idleMs` given on the command line when it holds one (PX9). A call marked `parts`
+// gives `onPart`, which appends each part to `<ack-file>.parts` as it is given, so a test sees parts arrive.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,7 +30,10 @@ const prepared = call.connectMs === null ? "ready" : await client.prepare({ time
 const preparedMs = performance.now() - started;
 if (call.writtenFile) fs.writeFileSync(call.writtenFile, String(process.pid));
 const ending = prepared !== "ready" || call.prepareOnly ? prepared
-	: await client.invoke({ host: "host-a", service: call.service ?? "fixture", operation: call.operation, input: call.input ?? {}, bound: call.bound ?? 5000 });
+	: await client.invoke({
+		host: "host-a", service: call.service ?? "fixture", operation: call.operation, input: call.input ?? {}, bound: call.bound ?? 5000,
+		...(call.parts ? { onPart: (part) => fs.appendFileSync(`${ackFile}.parts`, `${JSON.stringify(part)}\n`) } : {}),
+	});
 ack({ ending, preparedMs, elapsedMs: performance.now() - started });
 // A call marked `natural` returns from the program as a short-lived command does, closing nothing and forcing
 // no exit: the process ends only if nothing of the client half still holds it.

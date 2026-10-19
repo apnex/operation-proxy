@@ -10,6 +10,9 @@
 // Operations: `echo` answers its input; `which` answers the proxy's process, its node and the identities it
 // was given; `hold` waits until the file `<records>/release` exists, then answers like `which`; `silent`
 // never answers; `gather` waits until `input.n` runs of `gather` are in flight together, then all answer.
+// Answering in parts (zorg's Delta 4, stage 6): `quiet` sends no part and answers `{cancelled: true}` once its
+// signal fires; `drip` sends `input.count` parts at once, awaiting each, then waits as `quiet` does. Each time
+// a run's signal fires, the run is recorded to `<records>/aborts.ndjson`, so a test sees a cancel reach the host.
 // AGP and the call layer are loaded only when the caller is built, by the proxy that owns the key.
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -18,6 +21,7 @@ import path from "node:path";
 const ANY = { $schema: "urn:apnex:shape-check:dialect:1" };
 export const SERVICES = ["fixture", "other"];
 const OPERATIONS = ["echo", "which", "hold", "silent", "gather"];
+const PARTS_OPERATIONS = ["quiet", "drip"];
 const REPLY = "operation-call/replies";
 
 /** Appends one JSON record as a line, in one write, so lines from several processes never interleave. */
@@ -87,10 +91,37 @@ export function fixtureProxyApplication(config) {
 						}
 					}),
 				};
+				const signalled = (c) => new Promise((resolve) => {
+					if (c.signal.aborted) resolve();
+					else c.signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				const partsHandlers = {
+					quiet: async (_input, c) => {
+						await signalled(c);
+						return { outcome: "answered", answer: { cancelled: true } };
+					},
+					drip: async (input, c) => {
+						for (let i = 0; i < (input.count ?? 0); i++) await c.part({ drip: i + 1 });
+						await signalled(c);
+						return { outcome: "answered", answer: { cancelled: true } };
+					},
+				};
+				const runRecord = (input, c) => {
+					record(runsFile, { pid: process.pid, service, operation: c.operation, input, invocation: c.invocation, attempt: c.attempt, origin: c.delivery.source.originNodeId, at: Date.now() });
+					const aborted = () => record(path.join(config.records, "aborts.ndjson"), { pid: process.pid, operation: c.operation, attempt: c.attempt, at: Date.now() });
+					if (c.signal.aborted) aborted();
+					else c.signal.addEventListener("abort", aborted, { once: true });
+				};
 				for (const name of OPERATIONS) {
 					await opening.host.declare({ name, input: ANY, answers: "whole" }, (input, c) => {
-						record(runsFile, { pid: process.pid, service, operation: c.operation, input, invocation: c.invocation, attempt: c.attempt, origin: c.delivery.source.originNodeId, at: Date.now() });
+						runRecord(input, c);
 						return handlers[name](input, c);
+					});
+				}
+				for (const name of PARTS_OPERATIONS) {
+					await opening.host.declare({ name, input: ANY, answers: "parts" }, (input, c) => {
+						runRecord(input, c);
+						return partsHandlers[name](input, c);
 					});
 				}
 			}
@@ -102,7 +133,7 @@ export function fixtureProxyApplication(config) {
 				isReady() {
 					const routes = proxyNode.operations.routes().candidates;
 					const acked = proxyNode.operations.routeExports().items.some((r) => r.endpoint === REPLY && r.remoteNodeId === "host-a" && r.state === "acked");
-					return acked && SERVICES.every((s) => OPERATIONS.every((o) => routes.some((r) => r.endpoint === `${s}/${o}` && r.originNodeId === "host-a")));
+					return acked && SERVICES.every((s) => [...OPERATIONS, ...PARTS_OPERATIONS].every((o) => routes.some((r) => r.endpoint === `${s}/${o}` && r.originNodeId === "host-a")));
 				},
 				async stop() {
 					record(path.join(config.records, "caller-stopped.ndjson"), { pid: process.pid });

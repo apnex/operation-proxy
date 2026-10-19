@@ -678,14 +678,16 @@ describe("PX8 - browser adapter (@apnex/operation-proxy/browser, D3-E3)", () => 
 registerCallerSuite((name, run) => test(`D4-E6, through the browser adapter, an allowance of 50 ms: ${name}`, { timeout: 120_000 }, run), browserHarness({ allowanceMs: 50 }), ["answer-in-parts", "cancel-invocation"]);
 
 /**
- * A page and a worker on one manual clock, joined by an in-memory port pair: what the worker posts reaches the
+ * A page and a worker on manual clocks of different origins, moved together by `advance`, joined by an in-memory
+ * port pair: what the worker posts reaches the
  * page a turn later unless the case holds it (`hold`, released by `release`) or drops it (`drop`), each by type;
  * what the page posts reaches the worker a turn later, recorded. Closing one port closes neither the other nor what
  * was already posted to it. The worker's caller is the case's: each call is recorded with `part(answer)`, which
  * gives the next part to its `onPart`, and `end(answer)`, which answers it.
  */
 function partsRig({ hopAllowanceMs = 50 } = {}) {
-	const clock = createManualHopClock();
+	const pageClock = createManualHopClock({ start: 10_000_000_000n });
+	const workerClock = createManualHopClock({ start: 900_000_000_000n });
 	const calls = [];
 	const toWorker = [];
 	const toPage = [];
@@ -739,12 +741,21 @@ function partsRig({ hopAllowanceMs = 50 } = {}) {
 			return ending;
 		},
 	};
-	const proxy = runBrowserProxy({ key: KEY, buildCaller: () => ({ caller, stop: () => undefined }), callerReady: () => undefined }, { clock, scope: {} });
+	const proxy = runBrowserProxy({ key: KEY, buildCaller: () => ({ caller, stop: () => undefined }), callerReady: () => undefined }, { clock: workerClock, scope: {} });
 	const client = createBrowserClient({ key: KEY, workerUrl: "https://example.test/worker.js", hopAllowanceMs }, {
-		clock, identities: machineIdentities, openPort() { proxy.connectPort(workerPort); return pagePort; },
+		clock: pageClock, identities: machineIdentities, openPort() { proxy.connectPort(workerPort); return pagePort; },
 	});
 	return {
-		clock, calls, toWorker, toPage, policy, proxy, client, workerPort,
+		pageClock, workerClock, calls, toWorker, toPage, policy, proxy, client, workerPort,
+		/** Moves both clocks by `ms` in steps of `by`, letting what each step posted cross, as time passing does. */
+		async advance(ms, by = 25) {
+			for (let left = ms; left > 0; left -= by) {
+				const d = Math.min(by, left);
+				workerClock.advance(d);
+				pageClock.advance(d);
+				await settle(2);
+			}
+		},
 		workerClosed: () => workerClosed,
 		/** Delivers what was held to the page, in order. */
 		release() { for (const data of held.splice(0)) turn(() => deliverToPage(data)); },
@@ -755,7 +766,7 @@ function partsRig({ hopAllowanceMs = 50 } = {}) {
 	};
 }
 
-test("PX8 (D4-E6): the page posts taken for each part and alive it reads, matched by the worker in order across a request's parts and alive messages before and after its end; a taken matching nothing, or naming another sequence, closes the port", async () => {
+test("PX8 (D4-E6): with page and worker on clocks of different origins, the page's deadline is moved by each part and alive it reads, and it posts taken for each, matched by the worker in order across a request's parts and alive messages before and after its end; a taken matching nothing, or naming another sequence, closes the port", async () => {
 	const r = partsRig();
 	try {
 		await r.proxy.ready;
@@ -763,14 +774,24 @@ test("PX8 (D4-E6): the page posts taken for each part and alive it reads, matche
 		const call = watch(r.call({ onPart: (p) => { parts.push(p.answer); } }));
 		await until(() => r.calls.length === 1, "the worker's call made");
 		assert.equal(r.toWorker.find((m) => m.type === "invoke").parts, true, "invoke carries parts");
+		assert.equal(r.calls[0].call.bound, 950, "the worker's call bound 950 on its own clock, so its alive every 475");
 		r.policy.hold.add("part").add("alive").add("end");
 		r.calls[0].part("one");
 		r.calls[0].part("two");
-		r.clock.advance(475);
+		await r.advance(475);
 		r.calls[0].part("three");
+		await settle();
+		assert.deepEqual(r.toPage.filter((m) => ["part", "alive", "end"].includes(m.type)).map((m) => m.type), ["part", "part", "alive", "part"], "posted while the page holds them");
+		r.policy.hold.clear();
+		r.release();
+		await until(() => parts.length === 3, "the parts read at 475");
+		// The alive at 950 and the end are held, so the alive's taken reaches the worker after it posted the end.
+		r.policy.hold.add("alive").add("end");
+		await r.advance(700);
+		assert.ok(!call.settled(), "at 1175, past the page's first deadline of 1000, the signs of life it read at 475 moved it to 1475");
 		r.calls[0].end("done");
 		await settle();
-		assert.deepEqual(r.toPage.filter((m) => ["part", "alive", "end"].includes(m.type)).map((m) => m.type), ["part", "part", "alive", "part", "end"], "all posted while the page holds them");
+		assert.deepEqual(r.toPage.filter((m) => ["alive", "end"].includes(m.type)).map((m) => m.type).slice(-2), ["alive", "end"]);
 		r.policy.hold.clear();
 		r.release();
 		await until(call.settled, "the ending read");
@@ -782,6 +803,7 @@ test("PX8 (D4-E6): the page posts taken for each part and alive it reads, matche
 			{ operationProxy: 1, type: "taken", request: 1, sequence: 2 },
 			{ operationProxy: 1, type: "taken", request: 1 },
 			{ operationProxy: 1, type: "taken", request: 1, sequence: 3 },
+			{ operationProxy: 1, type: "taken", request: 1 },
 		], "a taken for each part and alive, in order, none for the end");
 		assert.equal(r.workerClosed(), false, "each matched, after the end too");
 		const next = watch(r.call({}));
@@ -856,7 +878,8 @@ test("PX8 (D4-E6): a page taking only alive messages more slowly than they are p
 		const aliveBytes = Buffer.byteLength(JSON.stringify({ operationProxy: 1, type: "alive", request: 1 }), "utf8");
 		const limit = Math.floor(CHANNEL_LIMITS.unwrittenBytes / aliveBytes);
 		for (let elapsed = 0; !r.workerClosed() && elapsed < limit + 20_000; elapsed += 5000) {
-			r.clock.advance(5000);
+			r.workerClock.advance(5000);
+			r.pageClock.advance(5000);
 			r.postToWorker({ operationProxy: 1, type: "ping" });
 			await settle(2);
 		}

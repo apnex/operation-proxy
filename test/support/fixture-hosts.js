@@ -9,8 +9,8 @@
 // part, awaiting each, then answers `{sent, results}`; `quiet` sends no part and answers `{cancelled: true}` once
 // its signal fires; `drip` sends a part each time the test releases a latch, `input.count` of them, then waits
 // as `quiet` does; `flood` sends `input.n` parts of a string of `input.size` characters, awaiting each, and
-// answers `{sent}`, stopping at the first that resolves false. Each run records whether, and when, its signal
-// fired, so a test sees a cancel reach the host. The hosts keep time on the clock port given, the system's own
+// answers `{sent}`, stopping at the first that resolves false. Each run records whether its signal fired, and the
+// reason's message, so a test sees a cancel reach the host and tells it from the host's own liveness lapsing. The hosts keep time on the clock port given, the system's own
 // when none is.
 import { createOperationHost } from "@apnex/operation-call";
 
@@ -90,7 +90,7 @@ export async function openFixtureHost(host, services = ["fixture"], clock = unde
 		};
 		const recorded = (input, c) => {
 			const run = { service, operation: c.operation, input, invocation: c.invocation, attempt: c.attempt, origin: c.delivery.source.originNodeId, aborted: c.signal.aborted };
-			if (!run.aborted) c.signal.addEventListener("abort", () => { run.aborted = true; }, { once: true });
+			if (!run.aborted) c.signal.addEventListener("abort", () => { run.aborted = true; run.reason = c.signal.reason?.message; }, { once: true });
 			runs.push(run);
 		};
 		for (const name of OPERATIONS) {

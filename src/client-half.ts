@@ -162,7 +162,11 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 		// the line the invocation is written on (PX4).
 		const attempt = `${invocation}.${randomHex(8)}`;
 		const fields = { invocation, host, service, operation, input, deadline: sooner.toString(), repeat, parts };
-		const sendable = requestSendable(writeRequest({ invocation, attempt, operation }, input)) && fitsLine(fields);
+		// A call accepting parts is checked with the `aliveWithinMs` the call beneath carries when the proxy makes it
+		// at once: the greater of 1 and half of the bound less the allowance, rounded down (PX5; EM12).
+		const beneath = bound - allowanceFor(allowanceMs, bound);
+		const aliveWithinMs = parts ? Math.max(1, Math.floor(beneath / 2)) : undefined;
+		const sendable = requestSendable(writeRequest({ invocation, attempt, operation }, input, aliveWithinMs)) && fitsLine(fields);
 		// Checked: the clock is read again, so a deadline that passed while checking - at it exactly included - wins
 		// over a refusal the checks found, as in the call layer's caller, and nothing is written (PX5).
 		if (clock.nowNs() >= firstDeadline) {

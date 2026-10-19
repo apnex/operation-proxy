@@ -12,7 +12,8 @@
 // never answers; `gather` waits until `input.n` runs of `gather` are in flight together, then all answer.
 // Answering in parts (zorg's Delta 4, stage 6): `quiet` sends no part and answers `{cancelled: true}` once its
 // signal fires; `drip` sends `input.count` parts at once, awaiting each, then waits as `quiet` does. Each time
-// a run's signal fires, the run is recorded to `<records>/aborts.ndjson`, so a test sees a cancel reach the host.
+// a run's signal fires, the run is recorded to `<records>/aborts.ndjson` with the reason's message, so a test sees
+// a cancel reach the host and tells it from the host's own liveness lapsing.
 // AGP and the call layer are loaded only when the caller is built, by the proxy that owns the key.
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -108,7 +109,7 @@ export function fixtureProxyApplication(config) {
 				};
 				const runRecord = (input, c) => {
 					record(runsFile, { pid: process.pid, service, operation: c.operation, input, invocation: c.invocation, attempt: c.attempt, origin: c.delivery.source.originNodeId, at: Date.now() });
-					const aborted = () => record(path.join(config.records, "aborts.ndjson"), { pid: process.pid, operation: c.operation, attempt: c.attempt, at: Date.now() });
+					const aborted = () => record(path.join(config.records, "aborts.ndjson"), { pid: process.pid, operation: c.operation, attempt: c.attempt, reason: c.signal.reason?.message ?? null, at: Date.now() });
 					if (c.signal.aborted) aborted();
 					else c.signal.addEventListener("abort", aborted, { once: true });
 				};

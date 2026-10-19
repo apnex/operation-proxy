@@ -20,7 +20,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { after, test } from "node:test";
 import { createCaller } from "@apnex/operation-call";
-import { callClockOf, createProxyClient, createProxyHalf } from "@apnex/operation-proxy";
+import { CHANNEL_LIMITS, callClockOf, createProxyClient, createProxyHalf } from "@apnex/operation-proxy";
 import { messageBytes, writeRequest } from "@apnex/operation-call/message-format";
 import { connectChannel } from "../../dist/machine-channel-adapter.js";
 import { machineClock, machineIdentities } from "../../dist/machine-clock-adapter.js";
@@ -1787,6 +1787,7 @@ test("PX5, PX6 (D4-E6): a client half that closes its connection writes no abort
 		assert.equal(parts.value().reason, "proxy-lost");
 		assert.equal(whole.value().reason, "proxy-lost");
 		await until(() => c.a.runs.find((r) => r.operation === "quiet").aborted === true, "the call in parts cancelled at the host");
+		assert.equal(c.a.runs.find((r) => r.operation === "quiet").reason, "the caller cancelled the invocation", "by the cancel");
 		await settle();
 		assert.equal(c.a.runs.find((r) => r.operation === "hold").aborted, false, "the whole call left to finish");
 		assert.equal(c.hop.sent("abort").length, 0, "no abort written");
@@ -1879,8 +1880,16 @@ test("PX6 (D4-E6): a client that reads nothing while parts are written to it has
 		await until(() => writtenToClient(c, "end").some((m) => m.request === 1), "the end of the first written");
 		raw.send(rawInvoke(c, { request: 2, operation: "flood", input: { n: 60, size: 1_000_000 }, parts: true, deadline: c.deadline(0, 600_000, 50) }));
 		await until(() => c.a.runs.find((r) => r.operation === "flood")?.aborted === true, "the flood cancelled at the host", 120_000);
-		const written = writtenToClient(c, "part").length;
-		assert.ok(written >= 33 && written < 60, `parts written until the bound: ${written}`);
+		assert.equal(c.a.runs.find((r) => r.operation === "flood").reason, "the caller cancelled the invocation", "by the cancel");
+		const partWrites = c.hop.writes.filter((w) => w.type === "part" && w.request === 2);
+		const refused = partWrites.findIndex((w) => !w.ok);
+		assert.ok(refused > 0, "a part refused");
+		const first = partWrites[refused];
+		assert.ok(first.unwrittenBefore + first.bytes > CHANNEL_LIMITS.unwrittenBytes, `the first part not written would have passed the bound: ${first.unwrittenBefore} + ${first.bytes}`);
+		assert.ok(partWrites.slice(0, refused).every((w) => w.ok && w.unwrittenBefore + w.bytes <= CHANNEL_LIMITS.unwrittenBytes), "every part written kept within it");
+		assert.ok(partWrites.slice(refused).every((w) => !w.ok), "none written after");
+		assert.ok(partWrites[refused - 1].unwrittenBefore + partWrites[refused - 1].bytes > CHANNEL_LIMITS.unwrittenBytes - first.bytes, "the bound reached, not some smaller one");
+		const written = refused;
 		raw.resume();
 		await until(() => raw.closed(), "the connection closed", 60_000);
 		assert.ok(raw.lines.some((l) => l.type === "end" && l.request === 1 && l.ending.answer === "written before the close"), "the end written before the close read");
@@ -1912,7 +1921,7 @@ test("PX6 (D4-E6): a client that reads steadily while more than 33570816 bytes i
 	});
 });
 
-test("PX6 (D4-E6, processes): a proxy stopped with SIGSTOP during a quiet invocation in parts ends it hop-stalled one bound after its last sign of life, its abort written, and after SIGCONT the call is ended at the host", { timeout: 90_000 }, async () => {
+test("PX6 (D4-E6, processes): a proxy stopped with SIGSTOP during a quiet invocation in parts ends it hop-stalled one bound after its last sign of life, its abort written, and after SIGCONT the call is ended at the host, by the cancel or by the host's own liveness, which lapsed meanwhile", { timeout: 90_000 }, async () => {
 	const p = processClient();
 	const pid = await servingPid(p);
 	const call = watch(p.call({ operation: "quiet", bound: 3000, onPart: () => undefined }));
@@ -1961,4 +1970,33 @@ test("PX6 (D4-E6, processes): a client killed during an invocation in parts leav
 	const attempt = f.runs().find((r) => r.operation === "quiet").attempt;
 	c.child.kill("SIGKILL");
 	await waitFor(() => f.aborts().some((a) => a.attempt === attempt), "the call cancelled at the host", 20_000);
+	assert.equal(f.aborts().find((a) => a.attempt === attempt).reason, "the caller cancelled the invocation", "by the cancel, well before the host's liveness of about 30 s could lapse");
 });
+
+test("PX5 (D4-E6): a call accepting parts is checked with the aliveWithinMs its call beneath carries: a request of exactly 16777216 bytes so is written and handed on, one byte more refused not-sendable with nothing written, prepared and unprepared", { timeout: 120_000 }, async () => {
+	const bound = 100_000;
+	// The call beneath is bound 100000 less the allowance of 50, so its request carries aliveWithinMs 49975.
+	const overhead = messageBytes(writeRequest({ invocation: "0000000000000-0000000000000000", attempt: "0000000000000-0000000000000000.00000000", operation: "echo" }, "", 49975));
+	const ofBytes = (bytes) => "x".repeat(bytes - overhead);
+	const over = (ending, what) => {
+		assert.deepEqual([ending.ending, ending.refusal], ["refused", NOT_SENDABLE], `${what}: refused not-sendable, as the call layer refuses`);
+		assert.ok(ending.attempt.startsWith(`${ending.invocation}.`), `${what}: under an attempt identity`);
+	};
+	await withCase({ readiness: new Promise(() => undefined) }, async (c) => {
+		over(await c.ended({ operation: "echo", input: ofBytes(16777217), bound, onPart: () => undefined }), "unprepared");
+		assert.deepEqual(c.wire, [], "unprepared: nothing written, not even hello");
+	});
+	await withCase({}, async (c) => {
+		assert.equal(await c.client.prepare({ timeMs: 1000 }), "ready");
+		const exact = await c.ended({ operation: "echo", input: ofBytes(16777216), bound, onPart: () => undefined });
+		assert.deepEqual([exact.ending, exact.agpCode, exact.proxyCode], ["not-delivered", "MESSAGE_TOO_LARGE", null], "handed on, and refused by AGP as a direct call is");
+		assert.equal(c.calls[0].bound, 99_950);
+		sameAsDirect(exact, c.calls[0], "the largest request of a call accepting parts");
+		const invokes = c.invokes().length;
+		over(await c.ended({ operation: "echo", input: ofBytes(16777217), bound, onPart: () => undefined }), "prepared");
+		assert.equal(c.invokes().length, invokes, "prepared: nothing of it written");
+		assert.equal(c.calls.length, 1, "the proxy made no call for it");
+		assert.equal((await c.ended({ operation: "echo", input: ofBytes(16777217), bound })).ending, "not-delivered", "the same input in a whole call fits, and is handed on");
+	});
+});
+

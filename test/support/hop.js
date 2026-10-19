@@ -51,6 +51,7 @@ export async function openHop(options) {
 		},
 	};
 	const wire = [];
+	const writes = [];
 	const proxyLinks = [];
 	const half = createProxyHalf({ key: KEY, clock, idleMs: options.idleMs ?? 86_400_000, onIdle: options.onIdle ?? (() => undefined) });
 	const inbound = options.inbound ?? ((_value, deliver) => deliver());
@@ -63,7 +64,17 @@ export async function openHop(options) {
 		}, { maxUnwrittenBytes: options.maxUnwrittenBytes ?? CHANNEL_LIMITS.unwrittenBytes });
 		proxyLinks.push(link);
 		handlers = half.accept({
-			write: (message) => { let ok = true; outbound(message, () => { wire.push({ to: "client", message }); ok = link.write(message); }); return ok; },
+			write: (message) => {
+				let ok = true;
+				outbound(message, () => {
+					wire.push({ to: "client", message });
+					// What the socket held unwritten as the message was given it, and whether the link wrote it (PX6).
+					const unwrittenBefore = socket.writableLength;
+					ok = link.write(message);
+					writes.push({ type: message.type, request: message.request, bytes: Buffer.byteLength(`${JSON.stringify(message)}\n`, "utf8"), unwrittenBefore, ok });
+				});
+				return ok;
+			},
 			close: () => link.close(),
 			hold: (keep) => link.hold(keep),
 		});
@@ -78,7 +89,7 @@ export async function openHop(options) {
 	};
 	const ready = becomeReady();
 	return {
-		t, clock, client, half, calls, wire, socketPath, dir, ready, server, proxyLinks,
+		t, clock, client, half, calls, wire, writes, socketPath, dir, ready, server, proxyLinks,
 		launches: () => launches,
 		/** The messages of one type on the wire, in order. */
 		sent: (type) => wire.filter((w) => w.message?.type === type).map((w) => w.message),

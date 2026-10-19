@@ -1716,7 +1716,7 @@ test("PX5 (D4-E6, amendment 4): after an abort the proxy keeps writing alive and
 	});
 });
 
-test("PX5, PX6 (D4-E6): the proxy's alive held in transit past the client half's deadline, and in turn its timer woken late past it, ends the invocation hop-stalled there; the alive read later and the proxy's later ending are discarded, the connection kept", async () => {
+test("PX5, PX6 (D4-E6): a hop that falls behind - the proxy's alive held in transit past the client half's deadline, and in turn its timer woken late past it, without and with an abort before - ends the invocation hop-stalled there; the alive read later and the proxy's later ending are discarded, the connection kept", async () => {
 	const tap = aliveTap("hold");
 	await withCase({ outbound: tap.outbound }, async (c) => {
 		const call = watch(c.call({ operation: "hold", bound: 1000, onPart: () => undefined }));
@@ -1735,18 +1735,26 @@ test("PX5, PX6 (D4-E6): the proxy's alive held in transit past the client half's
 		assert.equal((await c.ended({ operation: "echo", input: "next" })).answer, "next", "the connection kept");
 		assert.equal(c.hop.sent("hello").length, 1);
 	});
-	await withCase({}, async (c) => {
-		const call = watch(c.call({ operation: "hold", bound: 1000, onPart: () => undefined }));
-		await until(() => c.a.holds.length === 1, "the call runs");
-		c.clock.move(1100);
-		c.clock.advance(0);
-		await until(call.settled, "the deadline, its timer and the proxy's alive timer woken late together");
-		assert.deepEqual(call.value(), stalled(call.value(), "hold"));
-		await until(() => writtenToClient(c, "alive").length >= 1, "the alive the late timer wrote");
-		await settle();
-		assert.equal(call.count(), 1, "the alive read after the deadline discarded");
-		assert.equal((await c.ended({ operation: "echo", input: "next" })).answer, "next", "the connection kept");
-	});
+	for (const aborted of [false, true]) {
+		await withCase({}, async (c) => {
+			const controller = new AbortController();
+			const call = watch(c.call({ operation: "hold", bound: 1000, onPart: () => undefined, signal: controller.signal }));
+			await until(() => c.a.holds.length === 1, "the call runs");
+			if (aborted) {
+				c.clock.move(300);
+				controller.abort();
+				await until(() => c.hop.sent("abort").length === 1, "the abort written at 300");
+			}
+			c.clock.move(aborted ? 800 : 1100);
+			c.clock.advance(0);
+			await until(call.settled, "the deadline, its timer and the proxy's alive timer woken late together");
+			assert.deepEqual(call.value(), stalled(call.value(), "hold"), aborted ? "with an abort before" : "with no abort");
+			await until(() => writtenToClient(c, "alive").length >= 1, "the alive the late timer wrote");
+			await settle();
+			assert.equal(call.count(), 1, "the alive read after the deadline discarded");
+			assert.equal((await c.ended({ operation: "echo", input: "next" })).answer, "next", "the connection kept");
+		});
+	}
 });
 
 test("PX5 (D4-E6): an abort after admission reaches the host as a cancel for a call in parts, which ends as the operation then ends; an abort after the ending writes nothing", async () => {

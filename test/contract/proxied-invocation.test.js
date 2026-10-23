@@ -931,9 +931,10 @@ test("PX5: the wall clock stepped forward and back while a call is in flight mov
 		try {
 			const started = process.hrtime.bigint();
 			const call = watch(c.call({ operation: "silent", bound: 1200 }));
+			const afterInvoke = process.hrtime.bigint();
 			await until(() => c.calls.length === 1, "the call made");
 			const sent = BigInt(c.invokes()[0].deadline);
-			assert.ok(sent - started >= ns(800) && sent - started < ns(810), "the deadline sent is on CLOCK_MONOTONIC, 800 ms after invoking");
+			assert.ok(sent >= started + ns(800) && sent <= afterInvoke + ns(800), "the deadline sent is on CLOCK_MONOTONIC, 800 ms after invoking");
 			Date.now = () => realNow() + 86_400_000;
 			await sleep(200);
 			Date.now = () => realNow() - 86_400_000;

@@ -1092,17 +1092,46 @@ test("PX6: an answer, a refusal and a delivery report each falling between the p
 });
 
 test("PX6: an application allowance of 0, whose invocation runs out its bound, ends bound-passed or hop-stalled as the race falls, and never otherwise", { timeout: 60_000 }, async () => {
+	await withTransit({ allowanceMs: 0 }, async (c, t) => {
+		const stalled = watch(c.call({ operation: "silent", bound: 25 }));
+		await until(() => c.calls.length === 1, "the zero-allowance call reaches the proxy's caller");
+		c.clock.advance(25);
+		await until(stalled.settled, "the client half's deadline comes first when no fractional transit floored the proxy's deadline");
+		assert.deepEqual([stalled.value().ending, stalled.value().reason, stalled.value().attempt, stalled.value().agpCode, stalled.value().deliveryReport], ["unknown", "hop-stalled", null, null, null]);
+		t.outboundMs = 0.5;
+		const carried = watch(c.call({ operation: "silent", bound: 25 }));
+		await until(() => c.calls.length === 2, "the second zero-allowance call reaches the proxy's caller");
+		assert.equal(c.calls[1].bound, 24, "24.5 ms left, rounded down to 24 ms");
+		c.clock.advance(24);
+		await until(carried.settled, "the proxy's floored-deadline end is read before the client half's 25 ms deadline");
+		assert.deepEqual([carried.value().ending, carried.value().reason], ["unknown", "bound-passed"]);
+		sameAsDirect(carried.value(), c.calls[1], "zero allowance, bound-passed carried back");
+		c.clock.advance(0.5);
+		await settle();
+		assert.equal(carried.count(), 1, "the client half's own deadline passing afterwards changes nothing");
+	});
 	await withCase({ clock: machineClock, allowanceMs: 0 }, async (c) => {
-		const seen = new Set();
-		for (let i = 0; i < 12; i++) {
-			const ending = await c.ended({ operation: "silent", bound: 25 });
-			assert.equal(ending.ending, "unknown");
-			assert.ok(["bound-passed", "hop-stalled"].includes(ending.reason), `call ${i + 1} ended ${ending.reason}`);
-			if (ending.reason === "bound-passed") sameAsDirect(ending, c.calls[i], `call ${i + 1}`);
-			else assert.deepEqual([ending.attempt, ending.agpCode, ending.deliveryReport], [null, null, null]);
-			seen.add(ending.reason);
+		assert.equal(await c.client.prepare({ timeMs: 5_000 }), "ready");
+		for (let i = 0; i < 4; i++) {
+			const ending = await c.ended({ operation: "silent", input: { call: i }, bound: 500 });
+			const direct = c.calls.find((r) => r.call.input?.call === i);
+			if (direct !== undefined) {
+				assert.equal(ending.ending, "unknown");
+				assert.ok(["bound-passed", "hop-stalled"].includes(ending.reason), `call ${i + 1} ended ${ending.reason}`);
+				if (ending.reason === "bound-passed") sameAsDirect(ending, direct, `call ${i + 1}`);
+				else assert.deepEqual([ending.attempt, ending.agpCode, ending.deliveryReport], [null, null, null]);
+			} else if (ending.ending === "not-delivered") {
+				assert.deepEqual([ending.proxyCode, ending.attempt, ending.agpCode], ["deadline-passed", null, null]);
+			} else {
+				assert.equal(ending.ending, "unknown");
+				assert.ok(["bound-passed", "hop-stalled"].includes(ending.reason));
+				if (ending.reason === "hop-stalled") assert.deepEqual([ending.attempt, ending.agpCode, ending.deliveryReport], [null, null, null]);
+				else {
+					assert.equal(typeof ending.attempt, "string");
+					assert.deepEqual([ending.agpCode, ending.deliveryReport], [null, null]);
+				}
+			}
 		}
-		assert.ok(seen.size >= 1);
 	});
 });
 

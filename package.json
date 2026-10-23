@@ -34,7 +34,7 @@
   ],
   "scripts": {
     "build": "tsc -p .",
-    "test": "npm run build && npm run test:types && node --test \"test/**/*.test.js\"",
+    "test": "npm run build && npm run test:types && node --test --test-concurrency=1 \"test/**/*.test.js\"",
     "test:types": "tsc -p test/types",
     "docs:check": "tools/check-docs.sh"
   },

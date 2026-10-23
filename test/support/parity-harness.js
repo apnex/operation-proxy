@@ -112,7 +112,7 @@ export function parityHarness({ allowanceMs = 50 } = {}) {
 	return {
 		hopAllowanceMs: allowanceMs,
 		async open(options = {}) {
-			const clock = options.realCallClock ? machineClock : createManualHopClock();
+			const clock = options.realCallClock ? machineClock : createManualHopClock({ earlyMs: options.earlyWakeMs ?? 0 });
 			const clientClock = faultableHopClock(clock);
 			const unhandled = [];
 			const onUnhandled = (error) => { unhandled.push(error); };
@@ -125,6 +125,10 @@ export function parityHarness({ allowanceMs = 50 } = {}) {
 				t = await openTopology({ holdDeliveryReports: options.holdDeliveryReports });
 				hop = await openHop({ clock, clientClock, allowanceMs, topology: t, connect: (base) => (observed = observedConnector(base)).connector });
 				await hop.ready;
+				if (options.realCallClock) {
+					const prepared = await hop.client.prepare({ timeMs: 5_000 });
+					if (prepared !== "ready") throw new Error(`expected the real-clock hop channel to be ready, got ${String(prepared)}`);
+				}
 			} catch (error) {
 				process.off("unhandledRejection", onUnhandled);
 				process.off("uncaughtException", onUnhandled);
@@ -138,7 +142,8 @@ export function parityHarness({ allowanceMs = 50 } = {}) {
 			};
 			// The suite's fixture hosts keep time on the call bound's timeline, the clock the proxy's call and the
 			// client half read (zorg's EM12; PX10).
-			const hostClock = callClockOf(clock);
+			const baseHostClock = callClockOf(clock);
+			const hostClock = options.realCallClock ? baseHostClock : Object.freeze({ ...baseHostClock, delays: clock.delays });
 			const hooks = {
 				...t.hooks,
 				callClock: () => hostClock,

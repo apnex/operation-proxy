@@ -42,7 +42,7 @@ export interface ClientConnector {
 	 * `absent` when nothing listens there; `unsafe` when the runtime directory, its secret or the channel's
 	 * path is refused (PX2).
 	 */
-	connect(handlers: LinkHandlers): Promise<ConnectOutcome>;
+	connect(handlers: LinkHandlers, options?: { readonly status?: boolean }): Promise<ConnectOutcome>;
 	/** Launches the proxy with the command the application supplies, detached and with its output discarded. */
 	launch(): void;
 }

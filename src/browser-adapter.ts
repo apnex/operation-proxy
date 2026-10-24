@@ -74,12 +74,20 @@ export interface BrowserClientOptions {
 	readonly identities?: IdentitySource;
 	/** Opens a `MessagePort` to the named `SharedWorker`; `new SharedWorker(workerUrl, { name }).port` by default. */
 	readonly openPort?: (workerUrl: string, name: string) => BrowserMessagePort | Promise<BrowserMessagePort>;
+	/**
+	 * Opens a `MessagePort` to an already-running `SharedWorker` for `client.status` without starting one, or returns
+	 * `null` when none runs (PX8); falls back to `openPort` when `openPort` is supplied, and never constructs a
+	 * `SharedWorker` when neither is supplied.
+	 */
+	readonly openStatusPort?: (workerUrl: string, name: string) => BrowserMessagePort | null | Promise<BrowserMessagePort | null>;
 }
 
 /** The proxy's caller in a browser worker (PX1, PX8, PX9). */
 export interface BrowserProxiedCaller {
 	readonly caller: CallLayerCaller;
 	stop?(): Promise<void> | void;
+	/** Optional synchronous callback returning application-specific plain JSON status for `status` replies (PX9). */
+	status?(): unknown;
 }
 
 /** What an application supplies to its proxy in a browser `SharedWorker` (PX8, PX9). */
@@ -150,6 +158,8 @@ interface PortSide {
 	readonly acknowledge?: boolean;
 	/** The worker: count each `part` and `alive` posted until its `taken` arrives, within the bound. */
 	readonly bounded?: boolean;
+	/** A status probe port on the page: sends no 5-second `ping` and arms no 15-second silence timer (PX8). */
+	readonly statusProbe?: boolean;
 }
 
 /** True when a plain JSON value is `{"operationProxy": 1, "type": "ping"}` with no extra fields. */
@@ -178,6 +188,7 @@ function portChannelLink(
 	let pingTimer: HopTimer | undefined;
 	let livenessTimer: HopTimer | undefined;
 	let lastHeardAt = clock.nowNs();
+	let sawHello = false;
 	/** On the worker: each `part` and `alive` posted and not yet taken, by request, oldest first, and their bytes. */
 	const posted = new Map<number, { readonly sequence: number | undefined; readonly bytes: number }[]>();
 	let postedBytes = 0;
@@ -233,12 +244,12 @@ function portChannelLink(
 	};
 
 	const armLiveness = (): void => {
-		if (!open) return;
+		if (!open || side.statusProbe) return;
 		try { livenessTimer?.cancel(); } catch { /* ignore */ }
 		const deadline = lastHeardAt + msToNs(BROWSER_LIVENESS_TIMEOUT_MS);
 		livenessTimer = atMoment(clock, deadline, () => {
 			if (!open) return;
-			if (clock.nowNs() >= lastHeardAt + msToNs(BROWSER_LIVENESS_TIMEOUT_MS)) {
+			if ((!side.bounded || sawHello) && clock.nowNs() >= lastHeardAt + msToNs(BROWSER_LIVENESS_TIMEOUT_MS)) {
 				closeLink();
 				return;
 			}
@@ -257,6 +268,7 @@ function portChannelLink(
 		armLiveness();
 		if (isPing(plain.value)) return;
 		const value = plain.value as { readonly [k: string]: unknown };
+		if (value.operationProxy === CHANNEL_VERSION && value.type === "hello") sawHello = true;
 		if (side.bounded && value.operationProxy === CHANNEL_VERSION && value.type === "taken") {
 			if (!take(value)) closeLink();
 			return;
@@ -285,8 +297,10 @@ function portChannelLink(
 		port.onmessage = onEvent;
 	}
 	port.start?.();
-	armPing();
-	armLiveness();
+	if (!side.statusProbe) {
+		armPing();
+		armLiveness();
+	}
 
 	return {
 		write(message: ChannelMessage): boolean {
@@ -345,7 +359,28 @@ export function createBrowserClient(application: BrowserClientApplication, optio
 		clock,
 		identities,
 		connector: {
-			async connect(handlers: LinkHandlers) {
+			async connect(handlers: LinkHandlers, connectOptions?: { readonly status?: boolean }) {
+				if (connectOptions?.status === true) {
+					const probe = options.openStatusPort ?? options.openPort;
+					if (typeof probe !== "function") return { kind: "absent" };
+					let port: BrowserMessagePort | null | undefined;
+					try {
+						port = await probe(application.workerUrl, name);
+					} catch (error) {
+						observePromises(error);
+						return { kind: "absent" };
+					}
+					if (port === null || port === undefined) return { kind: "absent" };
+					const link = portChannelLink(
+						port,
+						clock,
+						handlers,
+						(message: ChannelMessage) => message,
+						(incoming) => incoming,
+						{ statusProbe: true },
+					);
+					return { kind: "connected", link };
+				}
 				const port = await openPort(application.workerUrl, name);
 				const link = portChannelLink(
 					port,
@@ -511,8 +546,10 @@ function validateBrowserCaller(candidate: unknown): BrowserProxiedCaller | undef
 		if (rootCopy === undefined) return fail();
 		const callerVal = rootCopy.caller;
 		const stopVal = rootCopy.stop;
+		const statusVal = rootCopy.status;
 		if (callerVal === null || typeof callerVal !== "object" || Array.isArray(callerVal)) return fail();
 		if (stopVal !== undefined && typeof stopVal !== "function") return fail();
+		if (statusVal !== undefined && typeof statusVal !== "function") return fail();
 		const invokeVal = (callerVal as { readonly invoke?: unknown }).invoke;
 		if (typeof invokeVal !== "function") return fail();
 		return rootCopy as unknown as BrowserProxiedCaller;
@@ -536,9 +573,10 @@ export function runBrowserProxy(application: BrowserProxyApplication, options: B
 		schedule: (delayMs, callback) => rawClock.schedule(delayMs, callback),
 	};
 	const callClock: PinnableCallClock = callClockOf(clock);
+	let builtCaller: BrowserProxiedCaller | undefined;
 	// In a browser, the browser starts the worker for the first page and ends it after the last, so there is no
 	// idle timer (PX8); we pass the maximum idleMs and stop the proxy half's idle timer at once.
-	const half: ProxyHalf = createProxyHalf({ key, clock, idleMs: 86_400_000, onIdle: () => undefined });
+	const half: ProxyHalf = createProxyHalf({ key, clock, idleMs: 86_400_000, onIdle: () => undefined, status: () => builtCaller?.status?.() });
 	half.stopIdle();
 	const links = new Set<ChannelLink>();
 	let failed = false;
@@ -612,6 +650,7 @@ export function runBrowserProxy(application: BrowserProxyApplication, options: B
 			const { value: candidate } = await awaitNative(() => application.buildCaller(key, { clock: callClock }));
 			const built = validateBrowserCaller(candidate);
 			if (built === undefined) throw new TypeError("buildCaller must return a plain object with caller.invoke");
+			builtCaller = built;
 			const { value: readyValue } = await awaitNative(() => application.callerReady(built));
 			if (readyValue !== undefined) {
 				observePromises(readyValue);

@@ -793,3 +793,71 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
 		assert.equal(f.exits().get(pid), 0);
 	});
 }
+
+test("PX7 (D8-E1): client.status and raw-channel valid, refused, malformed, empty and overlapping pre-hello probes preserve idleDeadlineNs, real activity ending beneath an open probe establishes idleDeadlineNs at that moment, and stopInvocations reports ready: false", async () => {
+	// 1. Valid client.status, raw status, refused (key-mismatch and version), malformed, empty and overlapping pre-hello probes preserve the original 1000 ms deadline.
+	await idleCase(async (c, idled) => {
+		await c.hop.ready;
+		c.clock.advance(200);
+		const s1 = await c.client.status({ timeMs: 500 });
+		assert.deepEqual(s1, { state: "running", ready: true, connections: 0, inFlight: 0, target: null });
+		c.clock.advance(200);
+		const badKey = await rawConnection(c.hop.socketPath);
+		badKey.send({ operationProxy: 1, type: "status", key: { application: "fixture", identity: "mallory", target: "other" } });
+		await until(() => badKey.closed(), "refused key-mismatch closed");
+		assert.deepEqual(badKey.lines, [{ operationProxy: 1, type: "refused", code: "key-mismatch" }]);
+		c.clock.advance(150);
+		const badVer = await rawConnection(c.hop.socketPath);
+		badVer.send({ operationProxy: 2, type: "status", key: { application: "fixture", identity: "alice", target: "loopback proxy -> host-a, host-b" } });
+		await until(() => badVer.closed(), "refused version closed");
+		assert.deepEqual(badVer.lines, [{ operationProxy: 1, type: "refused", code: "version" }]);
+		c.clock.advance(150);
+		const malformed = await rawConnection(c.hop.socketPath);
+		malformed.write("not-json\n");
+		await until(() => malformed.closed(), "malformed probe closed");
+		c.clock.advance(100);
+		// Overlapping pre-hello probes: one empty probe held open while a client.status runs and closes, then the empty probe closes at t = 900 ms.
+		const heldProbe = await rawConnection(c.hop.socketPath);
+		await until(() => c.hop.half.connections() === 1, "held pre-hello probe accepted");
+		const s2 = await c.client.status({ timeMs: 500 });
+		assert.deepEqual(s2, { state: "running", ready: true, connections: 0, inFlight: 0, target: null }, "connections excludes pre-hello probes");
+		c.clock.advance(100);
+		heldProbe.end();
+		await until(() => c.hop.half.connections() === 0, "held pre-hello probe closed");
+		// At t = 900 ms, 99 ms more is 999 ms (still alive), and 1 ms more is 1000 ms (original deadline expires!).
+		c.clock.advance(99);
+		assert.equal(idled(), 0, "still alive at 999 ms");
+		c.clock.advance(1);
+		assert.equal(idled(), 1, "expired at original 1000 ms deadline despite probes");
+	});
+
+	// 2. Real client activity ending at t = 500 ms while a pre-hello probe is open establishes idleDeadlineNs = 1500 ms at t = 500 ms, not when the probe closes at t = 800 ms.
+	await idleCase(async (c, idled) => {
+		await c.hop.ready;
+		c.clock.advance(200);
+		assert.equal(await c.client.prepare({ timeMs: 500 }), "ready");
+		c.clock.advance(300);
+		// Open a pre-hello probe at t = 500 ms while the real client is still connected.
+		const probe = await rawConnection(c.hop.socketPath);
+		await until(() => c.hop.half.connections() === 2, "both real client and pre-hello probe open");
+		// Close the real client at t = 500 ms: conns.size becomes 0 while helloConns.size is 1, establishing idleDeadlineNs = 1500 ms!
+		c.client.close();
+		await until(() => c.hop.half.connections() === 1, "real client closed while probe stays open");
+		c.clock.advance(300);
+		// Close the probe at t = 800 ms: deadline must still be 1500 ms (700 ms remaining), not 1800 ms!
+		probe.end();
+		await until(() => c.hop.half.connections() === 0, "probe closed at 800 ms");
+		c.clock.advance(699);
+		assert.equal(idled(), 0, "alive at 1499 ms");
+		c.clock.advance(1);
+		assert.equal(idled(), 1, "expired at 1500 ms (1000 ms after real activity ended at 500 ms)");
+	});
+
+	// 3. After stopInvocations(), status reports ready: false.
+	await idleCase(async (c) => {
+		await c.hop.ready;
+		assert.equal((await c.client.status({ timeMs: 500 })).ready, true);
+		c.hop.half.stopInvocations();
+		assert.deepEqual(await c.client.status({ timeMs: 500 }), { state: "running", ready: false, connections: 0, inFlight: 0, target: null });
+	});
+});

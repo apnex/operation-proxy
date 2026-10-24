@@ -33,10 +33,11 @@
  * cleanup, each of which runs on its own, so a timer that cannot be cancelled changes nothing.
  * Nothing here is particular to one runtime (zorg's principle 6).
  */
-import { readCallRequest, type CallRequest, type IdentitySource, type JsonValue, type OperationCaller, type RefusalRecord } from "@apnex/operation-call";
+import { MAX_BOUND_MS, readCallRequest, type CallRequest, type IdentitySource, type JsonValue, type OperationCaller, type RefusalRecord } from "@apnex/operation-call";
 import { requestSendable, writeRequest } from "@apnex/operation-call/message-format";
 import { observePromises, toCanonicalJson, utf8ByteLength } from "@apnex/shape-check";
-import { CHANNEL_LIMITS, writeInvoke } from "./channel-messages.js";
+import type { ChannelLink, LinkHandlers } from "./channel-link.js";
+import { CHANNEL_LIMITS, readStatusOrRefused, writeInvoke, writeStatusRequest } from "./channel-messages.js";
 import { Preparer, type ClientConnector, type Connection, type Prepared, type Waiter, type WrittenInvocation } from "./client-preparing.js";
 import { hopUnknown, preparingNotDelivered, proxyNotDelivered, type CarriedEnding, type PreparingEnding, type ProxiedEnding } from "./endings.js";
 import { atMoment, msToNs, type HopClock, type HopTimer } from "./hop-clock.js";
@@ -73,6 +74,20 @@ export interface PrepareOptions {
 	readonly repeat?: boolean;
 }
 
+/** How a caller queries the proxy's status without starting one (PX5, PX6; zorg's Delta 8, BL18). */
+export interface StatusOptions {
+	/** The time left until the status deadline, in milliseconds on the client half's clock (0 to 2147483647). */
+	readonly timeMs: number;
+	/** Stops the status check when it fires: `status` then rejects with the signal's reason. */
+	readonly signal?: AbortSignal;
+}
+
+/** What `client.status` resolves to (PX5, PX6; zorg's Delta 8, BL18). */
+export type ProxyStatus =
+	| { readonly state: "stopped" }
+	| { readonly state: "running"; readonly ready: boolean; readonly connections: number; readonly inFlight: number; readonly target: JsonValue }
+	| { readonly state: "unreachable"; readonly proxyCode: "proxy-unreachable" | "deadline-passed" | "runtime-dir-unsafe" | "key-mismatch" | "version" };
+
 /**
  * The client half: the call layer's caller interface, through the proxy. It is an `OperationCaller` (EM12): each
  * ending it gives is one the interface admits, so code written against the interface runs on it unchanged.
@@ -86,6 +101,10 @@ export interface ProxyClient extends OperationCaller {
 	 * PX2 and PX6 give, which no later `welcome` supersedes.
 	 */
 	prepare(options: PrepareOptions): Promise<"ready" | PreparingEnding>;
+	/**
+	 * Queries the proxy's status over one probe connection without starting a proxy when none is running (PX5, PX6).
+	 */
+	status(options: StatusOptions): Promise<ProxyStatus>;
 	/** A new invocation identity, as EM11 writes it. */
 	newInvocation(): string;
 	/** Closes the client half's connections; invocations written on them end `unknown` with `proxy-lost`. */
@@ -387,7 +406,182 @@ export function createProxyClient(options: ProxyClientOptions): ProxyClient {
 		});
 	};
 
-	return Object.freeze({ invoke, prepare, newInvocation, close: () => preparer.close() });
+	const status = (statusOptions: StatusOptions): Promise<ProxyStatus> => {
+		let start: bigint;
+		try {
+			start = clock.nowNs();
+		} catch (error) {
+			observePromises(error);
+			return Promise.reject(error);
+		}
+		if (statusOptions === null || typeof statusOptions !== "object" || Array.isArray(statusOptions)) {
+			return Promise.reject(new TypeError("status needs { timeMs }, the finite time left until its deadline in milliseconds"));
+		}
+		let timeMs: unknown;
+		let signal: unknown;
+		try {
+			timeMs = statusOptions.timeMs;
+			signal = statusOptions.signal;
+		} catch (error) {
+			observePromises(error);
+			return Promise.reject(error);
+		}
+		if (typeof timeMs !== "number" || !Number.isFinite(timeMs) || timeMs < 0 || timeMs > MAX_BOUND_MS) {
+			return Promise.reject(new RangeError("status needs timeMs to be a finite number from 0 to 2147483647"));
+		}
+		if (signal !== undefined && !(signal instanceof AbortSignal)) {
+			return Promise.reject(new TypeError("status signal must be an AbortSignal"));
+		}
+		if (signal?.aborted === true) {
+			return Promise.reject(signal.reason);
+		}
+		const deadline = start + BigInt(Math.floor(timeMs * 1e6));
+		let afterCheck: bigint;
+		try {
+			afterCheck = clock.nowNs();
+		} catch (error) {
+			observePromises(error);
+			return Promise.reject(error);
+		}
+		if (afterCheck >= deadline) {
+			return Promise.resolve(Object.freeze({ state: "unreachable", proxyCode: "deadline-passed" } as const));
+		}
+		return new Promise((resolve, reject) => {
+			let decided = false;
+			let timer: HopTimer | undefined;
+			let link: ChannelLink | undefined;
+			const done = (): boolean => {
+				if (decided) return false;
+				decided = true;
+				guarded(() => timer?.cancel());
+				guarded(() => signal?.removeEventListener("abort", aborted));
+				if (link !== undefined) {
+					const active = link;
+					link = undefined;
+					guarded(() => active.close());
+				}
+				return true;
+			};
+			const settleUnreachable = (proxyCode: "proxy-unreachable" | "deadline-passed" | "runtime-dir-unsafe" | "key-mismatch" | "version"): void => {
+				if (done()) resolve(Object.freeze({ state: "unreachable", proxyCode }));
+			};
+			const deadlinePassed = (): boolean => {
+				try {
+					return clock.nowNs() >= deadline;
+				} catch {
+					return false;
+				}
+			};
+			const atDeadline = (): void => {
+				if (decided) return;
+				let now: bigint | undefined;
+				try {
+					now = clock.nowNs();
+				} catch {
+					// The port failed: the timer's word is taken that the deadline came (EM12).
+				}
+				if (now !== undefined && now < deadline) {
+					try {
+						timer = atMoment(clock, deadline, atDeadline);
+						return;
+					} catch {
+						// A timer that cannot be set again leaves the timer's word to stand.
+					}
+				}
+				settleUnreachable("proxy-unreachable");
+			};
+			const aborted = (): void => {
+				if (done()) reject(signal?.reason);
+			};
+			const handlers: LinkHandlers = {
+				message(raw: unknown): void {
+					if (decided) return;
+					if (deadlinePassed()) {
+						settleUnreachable("proxy-unreachable");
+						return;
+					}
+					const msg = readStatusOrRefused(raw);
+					if (msg === undefined) {
+						settleUnreachable("proxy-unreachable");
+						return;
+					}
+					if (msg.type === "refused") {
+						settleUnreachable(msg.code);
+						return;
+					}
+					if (done()) {
+						resolve(Object.freeze({
+							state: "running",
+							ready: msg.ready,
+							connections: msg.connections,
+							inFlight: msg.inFlight,
+							target: freezeJson(msg.target),
+						}));
+					}
+				},
+				closed(): void {
+					settleUnreachable("proxy-unreachable");
+				},
+			};
+			timer = atMoment(clock, deadline, atDeadline);
+			signal?.addEventListener("abort", aborted, { once: true });
+			Promise.resolve()
+				.then(() => connector.connect(handlers, { status: true }))
+				.then(
+					(outcome) => {
+						if (decided) {
+							if (outcome.kind === "connected") guarded(() => outcome.link.close());
+							return;
+						}
+						if (deadlinePassed()) {
+							if (outcome.kind === "connected") link = outcome.link;
+							settleUnreachable("proxy-unreachable");
+							return;
+						}
+						if (outcome.kind === "absent") {
+							if (done()) resolve(Object.freeze({ state: "stopped" }));
+							return;
+						}
+						if (outcome.kind === "unsafe") {
+							settleUnreachable("runtime-dir-unsafe");
+							return;
+						}
+						link = outcome.link;
+						if (!link.write(writeStatusRequest(key))) {
+							settleUnreachable("proxy-unreachable");
+						}
+					},
+					(error: unknown) => {
+						observePromises(error);
+						settleUnreachable("proxy-unreachable");
+					},
+				);
+		});
+	};
+
+	return Object.freeze({ invoke, prepare, status, newInvocation, close: () => preparer.close() });
+}
+
+/** Deeply freezes a plain JSON value in place. */
+function freezeJson<T extends JsonValue>(value: T): T {
+	if (value === null || typeof value !== "object") return value;
+	const stack: object[] = [value];
+	while (stack.length > 0) {
+		const current = stack.pop() as object;
+		if (Object.isFrozen(current)) continue;
+		Object.freeze(current);
+		if (Array.isArray(current)) {
+			for (const item of current) {
+				if (item !== null && typeof item === "object") stack.push(item);
+			}
+		} else {
+			for (const key of Object.keys(current)) {
+				const item = (current as { readonly [k: string]: unknown })[key];
+				if (item !== null && typeof item === "object") stack.push(item as object);
+			}
+		}
+	}
+	return value;
 }
 
 /** Runs one step of cleanup on its own: a step that throws changes nothing already decided, nor any step after it. */

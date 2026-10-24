@@ -9,7 +9,7 @@
  * keyDigest - one-identity-per-proxy, proxy-on-demand: the digest that names a key's sockets.
  * CHANNEL_LIMITS, DEFAULT_HOP_ALLOWANCE_MS - proxied-invocation, host-local-proxy-channel: PX4's line limit, PX5's allowance.
  */
-export { createProxyClient, DEFAULT_HOP_ALLOWANCE_MS, type PrepareOptions, type ProxyClient, type ProxyClientOptions } from "./client-half.js";
+export { createProxyClient, DEFAULT_HOP_ALLOWANCE_MS, type PrepareOptions, type ProxyClient, type ProxyClientOptions, type ProxyStatus, type StatusOptions } from "./client-half.js";
 export { createProxyHalf, type CallLayerCaller, type ProxyHalf, type ProxyHalfOptions } from "./proxy-half.js";
 export { callClockOf, type HopClock, type HopTimer, type PinnableCallClock } from "./hop-clock.js";
 export { keyDigest, type ProxyKey } from "./key.js";

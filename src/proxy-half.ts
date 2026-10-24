@@ -28,9 +28,9 @@
  * Nothing here is particular to one runtime.
  */
 import { MAX_BOUND_MS, type CallLayerEnding, type CallRequest, type JsonValue } from "@apnex/operation-call";
-import { observePromises, readPlainJson } from "@apnex/shape-check";
+import { observePromises, readPlainJson, utf8ByteLength } from "@apnex/shape-check";
 import type { ChannelLink, LinkHandlers } from "./channel-link.js";
-import { isOtherVersion, readHello, readInvokeOrAbort, writeAliveMessage, writeEnd, writePartMessage, writeRefused, writeWelcome, type InvokeMessage } from "./channel-messages.js";
+import { CHANNEL_LIMITS, isOtherVersion, readHelloOrStatus, readInvokeOrAbort, writeAliveMessage, writeEnd, writePartMessage, writeRefused, writeStatusReply, writeWelcome, type InvokeMessage } from "./channel-messages.js";
 import { hasExactly, isObject, proxyNotDelivered, readCarriedEnding, type CarriedEnding } from "./endings.js";
 import { atMoment, msToNs, NS_PER_MS, type HopClock, type HopTimer, type PinnableCallClock } from "./hop-clock.js";
 import { checkKey, sameKey, type ProxyKey } from "./key.js";
@@ -64,6 +64,8 @@ export interface ProxyHalfOptions {
 	readonly idleMs: number;
 	/** Called once, when the idle timer fires and the proxy is still idle; the host then stops it. */
 	readonly onIdle: () => void;
+	/** Optional synchronous callback returning application-specific plain JSON status for `status` replies (PX9). */
+	readonly status?: () => unknown;
 }
 
 /** The proxy half. */
@@ -128,26 +130,38 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 	const idleMs = checkIdleTime(options.idleMs);
 	const { clock, onIdle } = options;
 	const conns = new Set<Conn>();
+	const helloConns = new Set<Conn>();
 	let caller: CallLayerCaller | undefined;
 	let callClock: PinnableCallClock | undefined;
 	let inFlight = 0;
 	let idleTimer: HopTimer | undefined;
+	let idleDeadlineNs: bigint | undefined;
 	let idleStopped = false;
 	let idleEnded = false;
 	let stoppingInvocations = false;
 	let drainWaiters: (() => void)[] = [];
 
-	const idle = (): boolean => conns.size === 0 && inFlight === 0;
-	/** Starts the idle timer when the proxy becomes idle, and cancels it when it stops being idle. */
+	const realIdle = (): boolean => conns.size === 0 && inFlight === 0;
+	const idle = (): boolean => realIdle() && helloConns.size === 0;
+	/** Starts the idle timer when the proxy becomes idle, and cancels it when it stops being idle (PX7). */
 	const reviewIdle = (): void => {
 		if (idleStopped || idleEnded) return;
-		if (!idle()) {
+		if (!realIdle()) {
+			idleTimer?.cancel();
+			idleTimer = undefined;
+			idleDeadlineNs = undefined;
+			return;
+		}
+		if (idleDeadlineNs === undefined) {
+			idleDeadlineNs = clock.nowNs() + msToNs(idleMs);
+		}
+		if (helloConns.size > 0) {
 			idleTimer?.cancel();
 			idleTimer = undefined;
 			return;
 		}
 		if (idleTimer !== undefined) return;
-		idleTimer = atMoment(clock, clock.nowNs() + msToNs(idleMs), () => {
+		idleTimer = atMoment(clock, idleDeadlineNs, () => {
 			// It checks again when it fires, and stays if a connection is open or a call is in flight. The check
 			// is made a turn later, so a connection already waiting to be accepted as the timer fires is counted.
 			idleTimer = clock.schedule(0, () => {
@@ -320,12 +334,42 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 					conn.link.write(writeRefused("version"));
 					return close(conn);
 				}
-				const hello = readHello(value);
-				if (hello === undefined) return close(conn);
-				if (!sameKey(hello.key, key)) {
+				const first = readHelloOrStatus(value);
+				if (first === undefined) return close(conn);
+				if (!sameKey(first.key, key)) {
 					conn.link.write(writeRefused("key-mismatch"));
 					return close(conn);
 				}
+				if (first.type === "status") {
+					const readyFlag = caller !== undefined && !stoppingInvocations;
+					let target: JsonValue = null;
+					if (options.status !== undefined) {
+						try {
+							const rawTarget = options.status();
+							const plain = readPlainJson(rawTarget);
+							if (plain.ok) {
+								const candidate = writeStatusReply(readyFlag, conns.size, inFlight, plain.value);
+								if (utf8ByteLength(`${JSON.stringify(candidate)}\n`) <= CHANNEL_LIMITS.lineBytes) {
+									target = plain.value;
+								}
+							} else {
+								observePromises(rawTarget);
+							}
+						} catch (error) {
+							observePromises(error);
+						}
+					}
+					const reply = writeStatusReply(readyFlag, conns.size, inFlight, target);
+					conn.state = "closed";
+					helloConns.delete(conn);
+					conn.link.write(reply);
+					close(conn);
+					reviewIdle();
+					return;
+				}
+				helloConns.delete(conn);
+				conns.add(conn);
+				reviewIdle();
 				if (caller === undefined) {
 					conn.state = "waiting";
 					return;
@@ -355,13 +399,14 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 	const half: ProxyHalf = Object.freeze({
 		accept(link: ChannelLink): LinkHandlers {
 			const conn: Conn = { link, state: "hello", used: new Set(), calls: new Map() };
-			conns.add(conn);
+			helloConns.add(conn);
 			reviewIdle();
 			return {
 				message: (value: unknown) => message(conn, value),
 				closed: () => {
 					if (conn.state === "closed") return;
 					conn.state = "closed";
+					helloConns.delete(conn);
 					conns.delete(conn);
 					// Its calls are finished by the call layer, and their endings dropped; nothing is repeated. Each
 					// invocation in parts is cancelled rather than left running (PX6).
@@ -383,7 +428,7 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 				conn.link.write(writeWelcome());
 			}
 		},
-		connections: () => conns.size,
+		connections: () => conns.size + helloConns.size,
 		inFlight: () => inFlight,
 		drained: () => inFlight === 0 ? Promise.resolve() : new Promise<void>((resolve) => { drainWaiters.push(resolve); }),
 		stopIdle(): void {
@@ -398,10 +443,10 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 			}
 		},
 		closeUnwelcomed(): void {
-			for (const conn of [...conns]) if (conn.state === "hello" || conn.state === "waiting") close(conn);
+			for (const conn of [...helloConns, ...conns]) if (conn.state === "hello" || conn.state === "waiting") close(conn);
 		},
 		closeAll(): void {
-			for (const conn of [...conns]) close(conn);
+			for (const conn of [...helloConns, ...conns]) close(conn);
 		},
 	});
 	// A proxy starts idle, with no connection open and no call in flight.

@@ -53,7 +53,7 @@ export async function openHop(options) {
 	const wire = [];
 	const writes = [];
 	const proxyLinks = [];
-	const half = createProxyHalf({ key: KEY, clock, idleMs: options.idleMs ?? 86_400_000, onIdle: options.onIdle ?? (() => undefined) });
+	const half = createProxyHalf({ key: KEY, clock, idleMs: options.idleMs ?? 86_400_000, onIdle: options.onIdle ?? (() => undefined), status: options.status });
 	const inbound = options.inbound ?? ((_value, deliver) => deliver());
 	const outbound = options.outbound ?? ((_message, write) => write());
 	const server = await listenChannel(socketPath, (socket) => {
@@ -80,7 +80,7 @@ export async function openHop(options) {
 		});
 	});
 	let launches = 0;
-	const baseConnector = { connect: (handlers) => connectChannel(socketPath, handlers), launch: () => { launches++; } };
+	const baseConnector = { connect: (handlers, connectOptions) => connectChannel(socketPath, handlers, connectOptions), launch: () => { launches++; } };
 	const connector = options.connect ? options.connect(baseConnector) : baseConnector;
 	const client = createProxyClient({ key: KEY, hopAllowanceMs: options.allowanceMs ?? 50, connector, clock: options.clientClock ?? clock, identities: machineIdentities });
 	const becomeReady = async () => {

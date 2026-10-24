@@ -17,6 +17,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { after, test } from "node:test";
 import { createCaller } from "@apnex/operation-call";
@@ -25,7 +26,7 @@ import { messageBytes, writeRequest } from "@apnex/operation-call/message-format
 import { connectChannel } from "../../dist/machine-channel-adapter.js";
 import { machineClock, machineIdentities } from "../../dist/machine-clock-adapter.js";
 import { ns, openCase, rawConnection, rawProxy, settle, until, watch, withCase } from "../support/case-hop.js";
-import { KEY } from "../support/hop.js";
+import { KEY, shortTempDir } from "../support/hop.js";
 import { createManualHopClock } from "../support/manual-hop-clock.js";
 import { openTopology } from "../support/topology.js";
 import { fixture, PROXY_MAIN, sleep, waitFor } from "../support/processes.js";
@@ -2028,5 +2029,391 @@ test("PX5 (D4-E6): a call accepting parts is checked with the aliveWithinMs its 
 		assert.equal(c.calls.length, 1, "the proxy made no call for it");
 		assert.equal((await c.ended({ operation: "echo", input: ofBytes(16777217), bound })).ending, "not-delivered", "the same input in a whole call fits, and is handed on");
 	});
+});
+
+test("PX4, PX5, PX6, PX9 (D8-E1): client.status when stopped, while starting, and when running with connections and inFlight; raw-channel unclosed, pipelined status+invoke, post-hello status, and malformed counter replies", async () => {
+	// 1. Stopped proxy: client.status returns { state: "stopped" } with 0 launches.
+	const stoppedDir = shortTempDir();
+	try {
+		let launches = 0;
+		const stoppedClient = createProxyClient({
+			key: KEY,
+			clock: createManualHopClock(),
+			identities: machineIdentities,
+			connector: {
+				connect: (handlers) => connectChannel(path.join(stoppedDir, "absent.sock"), handlers),
+				launch: () => { launches++; },
+			},
+		});
+		const stoppedStatus = await stoppedClient.status({ timeMs: 1000 });
+		assert.deepEqual(stoppedStatus, { state: "stopped" });
+		assert.ok(Object.isFrozen(stoppedStatus));
+		assert.equal(launches, 0, "status never calls launch()");
+	} finally {
+		fs.rmSync(stoppedDir, { recursive: true, force: true });
+	}
+
+	// 2. Starting (before callerReady resolves) and running (with waiting/welcomed connections, active calls, and nested target deeply frozen).
+	const readyGate = Promise.withResolvers();
+	let currentTarget = null;
+	await withCase({ readiness: readyGate.promise, status: () => currentTarget }, async (c) => {
+		const startingStatus = await c.client.status({ timeMs: 1000 });
+		assert.deepEqual(startingStatus, { state: "running", ready: false, connections: 0, inFlight: 0, target: null });
+		assert.equal(c.hop.launches(), 0);
+
+		// A client waiting for welcome (sent hello before callerReady) counts in connections while ready is still false.
+		const waitingPrep = watch(c.client.prepare({ timeMs: 5000 }));
+		await until(() => c.hop.sent("hello").length === 1, "hello sent while waiting");
+		currentTarget = { phase: "starting", nested: { tags: ["a", "b"] } };
+		const waitingStatus = await c.client.status({ timeMs: 1000 });
+		assert.deepEqual(waitingStatus, {
+			state: "running",
+			ready: false,
+			connections: 1,
+			inFlight: 0,
+			target: { phase: "starting", nested: { tags: ["a", "b"] } },
+		});
+		assert.ok(Object.isFrozen(waitingStatus));
+		assert.ok(Object.isFrozen(waitingStatus.target));
+		assert.ok(Object.isFrozen(waitingStatus.target.nested));
+		assert.ok(Object.isFrozen(waitingStatus.target.nested.tags));
+
+		// Release callerReady and start a held call: ready is true, connections is 1 (excluding the status probe itself), inFlight is 1.
+		readyGate.resolve();
+		await until(waitingPrep.settled, "prepare settled ready");
+		assert.equal(waitingPrep.value(), "ready");
+		const heldCall = watch(c.call({ operation: "hold", bound: 5000 }));
+		await until(() => c.a.holds.length === 1, "call in flight");
+		currentTarget = { node: "alice.0123456789abcdef", connected: true };
+		const activeStatus = await c.client.status({ timeMs: 1000 });
+		assert.deepEqual(activeStatus, {
+			state: "running",
+			ready: true,
+			connections: 1,
+			inFlight: 1,
+			target: { node: "alice.0123456789abcdef", connected: true },
+		});
+
+		// Raw-channel probe that never closes on its own and pipelines status + invoke in a single write, plus sends more after:
+		// proxy answers status once, initiates closure, runs zero additional invocations, and leaves inFlight at 1.
+		const raw = await rawConnection(c.hop.socketPath);
+		const statusLine = JSON.stringify({ operationProxy: 1, type: "status", key: KEY });
+		const invokeLine = JSON.stringify(rawInvoke(c, { request: 1, operation: "echo", input: "must-be-ignored" }));
+		raw.write(`${statusLine}\n${invokeLine}\n`);
+		await until(() => raw.closed(), "proxy closes raw status connection");
+		assert.equal(raw.lines.length, 1, "exactly one status reply");
+		assert.deepEqual(raw.lines[0], {
+			operationProxy: 1,
+			type: "status",
+			ready: true,
+			connections: 1,
+			inFlight: 1,
+			target: { node: "alice.0123456789abcdef", connected: true },
+		});
+		assert.equal(c.calls.length, 1, "pipelined invoke after status was ignored");
+		assert.equal(c.hop.half.inFlight(), 1, "inFlight unchanged");
+
+		// Sending status after hello on an invocation connection breaks PX4's table and closes the connection.
+		const postHello = await rawConnection(c.hop.socketPath);
+		postHello.send({ operationProxy: 1, type: "hello", key: KEY });
+		await until(() => postHello.lines.length === 1 && postHello.lines[0].type === "welcome", "welcomed");
+		postHello.send({ operationProxy: 1, type: "status", key: KEY });
+		await until(() => postHello.closed(), "status after hello closes connection");
+		assert.equal(postHello.lines.length, 1, "no status reply after hello");
+
+		c.a.holds[0].release();
+		await until(heldCall.settled, "held call finishes");
+	});
+
+	// 3. Malformed status replies from a raw server (fractional, negative, or unsafe > 9007199254740991 counters, or wrong type) close the link and resolve proxy-unreachable.
+	for (const badReply of [
+		{ operationProxy: 1, type: "status", ready: true, connections: -1, inFlight: 0, target: null },
+		{ operationProxy: 1, type: "status", ready: true, connections: 1.5, inFlight: 0, target: null },
+		{ operationProxy: 1, type: "status", ready: true, connections: 9007199254740992, inFlight: 0, target: null },
+		{ operationProxy: 1, type: "status", ready: true, connections: 0, inFlight: -1, target: null },
+		{ operationProxy: 1, type: "status", ready: true, connections: 0, inFlight: 0.5, target: null },
+		{ operationProxy: 1, type: "status", ready: true, connections: 0, inFlight: 9007199254740992, target: null },
+		{ operationProxy: 1, type: "welcome" },
+	]) {
+		const dir = shortTempDir();
+		const sock = path.join(dir, "bad.sock");
+		let serverSocketClosed = false;
+		const srv = net.createServer((s) => {
+			s.on("close", () => { serverSocketClosed = true; });
+			s.once("data", () => { s.write(`${JSON.stringify(badReply)}\n`); });
+		});
+		await new Promise((r) => srv.listen(sock, r));
+		try {
+			const client = createProxyClient({
+				key: KEY,
+				clock: createManualHopClock(),
+				identities: machineIdentities,
+				connector: { connect: (h) => connectChannel(sock, h), launch: () => undefined },
+			});
+			const res = await client.status({ timeMs: 1000 });
+			assert.deepEqual(res, { state: "unreachable", proxyCode: "proxy-unreachable" });
+			await until(() => serverSocketClosed, "client closed link on malformed status reply");
+		} finally {
+			await new Promise((r) => srv.close(r));
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+});
+
+test("PX5, PX6, PX9 (D8-E1): client.status option and getter validation, pending-connect timeout/abort/rejection, unsafe, refusals, early timer wake, timer-held late outcomes, D54/D55 status() callback protection, and 16785408-byte line boundary", { timeout: 120_000 }, async () => {
+	await withCase({}, async (c) => {
+		// 1. Option validation: null, non-object, array, bad timeMs, bad signal, getter throws, single-read after clock.nowNs().
+		for (const badOpt of [null, undefined, "100", 100, []]) {
+			await assert.rejects(() => c.client.status(badOpt), TypeError);
+		}
+		for (const badTime of [-1, -0.001, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2147483648, "100", null]) {
+			await assert.rejects(() => c.client.status({ timeMs: badTime }), RangeError);
+		}
+		await assert.rejects(() => c.client.status({ timeMs: 100, signal: {} }), TypeError);
+
+		// Fractional timeMs is accepted and floored to nanoseconds.
+		const fracRes = await c.client.status({ timeMs: 10.5 });
+		assert.equal(fracRes.state, "running");
+
+		// Clock is read before option getters, each option property is read once, and a getter throwing a rejected Promise is observed.
+		const order = [];
+		const orderClock = {
+			nowNs: () => { order.push("clock"); return c.clock.nowNs(); },
+			schedule: (d, cb) => c.clock.schedule(d, cb),
+		};
+		const orderClient = createProxyClient({
+			key: KEY,
+			clock: orderClock,
+			identities: machineIdentities,
+			connector: { connect: (h) => connectChannel(c.hop.socketPath, h), launch: () => undefined },
+		});
+		let timeReads = 0;
+		let sigReads = 0;
+		const optWithGetters = {
+			get timeMs() { timeReads++; order.push("timeMs"); return 100; },
+			get signal() { sigReads++; order.push("signal"); return undefined; },
+		};
+		assert.equal((await orderClient.status(optWithGetters)).state, "running");
+		assert.deepEqual(order.slice(0, 4), ["clock", "timeMs", "signal", "clock"]);
+		assert.equal(timeReads, 1);
+		assert.equal(sigReads, 1);
+
+		const boom = new Error("getter-boom");
+		boom.leaked = Promise.reject(new Error("unhandled-in-getter"));
+		await assert.rejects(() => orderClient.status({ get timeMs() { throw boom; } }), (err) => err === boom);
+
+		// Pre-aborted signal rejects with signal.reason and connects nothing.
+		let connectCalls = 0;
+		const spyClient = createProxyClient({
+			key: KEY,
+			clock: c.clock,
+			identities: machineIdentities,
+			connector: { connect: async () => { connectCalls++; return { kind: "absent" }; }, launch: () => undefined },
+		});
+		const preAborted = new AbortController();
+		const abortReason = new Error("already-aborted");
+		preAborted.abort(abortReason);
+		await assert.rejects(() => spyClient.status({ timeMs: 100, signal: preAborted.signal }), (err) => err === abortReason);
+		assert.equal(connectCalls, 0);
+
+		// timeMs: 0 or deadline passed during option check resolves deadline-passed with nothing connected.
+		assert.deepEqual(await spyClient.status({ timeMs: 0 }), { state: "unreachable", proxyCode: "deadline-passed" });
+		assert.equal(connectCalls, 0);
+	});
+
+	// 2. Pending connect timeout, late connect closing link without writing, abort during pending connect, sync throw, async rejection, and unsafe.
+	const clock = createManualHopClock();
+	let pendingResolve;
+	let lateLinkClosed = false;
+	let lateLinkWrites = 0;
+	const pendingClient = createProxyClient({
+		key: KEY,
+		clock,
+		identities: machineIdentities,
+		connector: {
+			connect: () => new Promise((r) => { pendingResolve = r; }),
+			launch: () => undefined,
+		},
+	});
+	const timedOut = watch(pendingClient.status({ timeMs: 100 }));
+	await settle();
+	clock.advance(99);
+	assert.equal(timedOut.settled(), false);
+	clock.advance(1);
+	await until(timedOut.settled, "pending connect timed out at 100 ms");
+	assert.deepEqual(timedOut.value(), { state: "unreachable", proxyCode: "proxy-unreachable" });
+	pendingResolve({
+		kind: "connected",
+		link: { write: () => { lateLinkWrites++; return true; }, close: () => { lateLinkClosed = true; }, hold: () => undefined },
+	});
+	await settle();
+	assert.equal(lateLinkClosed, true, "late link closed at once");
+	assert.equal(lateLinkWrites, 0, "nothing written to late link");
+
+	// Abort while connect is pending:
+	const abortPending = new AbortController();
+	const abortErr = new Error("abort-pending");
+	const abortedWatch = pendingClient.status({ timeMs: 1000, signal: abortPending.signal });
+	await settle();
+	abortPending.abort(abortErr);
+	await assert.rejects(() => abortedWatch, (err) => err === abortErr);
+
+	// Sync connect throw, async connect rejection, and { kind: "unsafe" }:
+	for (const [mode, expectedCode] of [
+		["throw", "proxy-unreachable"],
+		["reject", "proxy-unreachable"],
+		["unsafe", "runtime-dir-unsafe"],
+	]) {
+		const cl = createProxyClient({
+			key: KEY,
+			clock,
+			identities: machineIdentities,
+			connector: {
+				connect: () => {
+					if (mode === "throw") {
+						const e = new Error("sync-throw");
+						e.p = Promise.reject(new Error("observed-sync"));
+						throw e;
+					}
+					if (mode === "reject") return Promise.reject(Object.assign(new Error("async-reject"), { p: Promise.reject(new Error("observed-async")) }));
+					return Promise.resolve({ kind: "unsafe" });
+				},
+				launch: () => undefined,
+			},
+		});
+		assert.deepEqual(await cl.status({ timeMs: 100 }), { state: "unreachable", proxyCode: expectedCode });
+	}
+
+	// 3. Refusal codes (key-mismatch and version), early timer wake re-arming, and timer-held late connected/status/refused outcomes.
+	await withCase({}, async (c) => {
+		const wrongKeyClient = createProxyClient({
+			key: { application: "fixture", identity: "other", target: KEY.target },
+			clock: c.clock,
+			identities: machineIdentities,
+			connector: { connect: (h) => connectChannel(c.hop.socketPath, h), launch: () => undefined },
+		});
+		assert.deepEqual(await wrongKeyClient.status({ timeMs: 500 }), { state: "unreachable", proxyCode: "key-mismatch" });
+	});
+
+	// Early timer wake (earlyMs: 200) re-arms and still accepts reply before 500 ms deadline:
+	const earlyClock = createManualHopClock({ earlyMs: 200 });
+	let releaseInbound;
+	await withCase({
+		clock: earlyClock,
+		inbound: (msg, deliver) => {
+			if (msg.type === "status") { releaseInbound = deliver; return; }
+			deliver();
+		},
+	}, async (c) => {
+		const st = watch(c.client.status({ timeMs: 500 }));
+		await until(() => releaseInbound !== undefined, "status request held");
+		earlyClock.advance(300); // Timer wakes 200 ms early at 300 ms, sees 300 < 500, and re-arms!
+		await settle();
+		assert.equal(st.settled(), false, "early wake did not expire status at 300 ms");
+		earlyClock.advance(100); // At 400 ms (< 500 ms), release the request!
+		releaseInbound();
+		await until(st.settled, "status settled after early wake");
+		assert.equal(st.value().state, "running");
+	});
+
+	// Timer held while clock moves to deadline: late connected, late status reply, and late refused reply each close link and resolve proxy-unreachable.
+	for (const lateKind of ["connected", "status", "refused"]) {
+		const baseClock = createManualHopClock();
+		const heldTimers = [];
+		const holdTimerClock = {
+			nowNs: () => baseClock.nowNs(),
+			schedule: (_d, cb) => { heldTimers.push(cb); return { cancel: () => undefined }; },
+		};
+		let capturedHandlers;
+		let connectDeferred = Promise.withResolvers();
+		let closedCount = 0;
+		const fakeLink = {
+			write: () => true,
+			close: () => { closedCount++; },
+			hold: () => undefined,
+		};
+		const lateClient = createProxyClient({
+			key: KEY,
+			clock: holdTimerClock,
+			identities: machineIdentities,
+			connector: {
+				connect: (h) => {
+					capturedHandlers = h;
+					if (lateKind === "connected") return connectDeferred.promise;
+					return Promise.resolve({ kind: "connected", link: fakeLink });
+				},
+				launch: () => undefined,
+			},
+		});
+		const w = watch(lateClient.status({ timeMs: 100 }));
+		await settle();
+		baseClock.move(100); // At the deadline, with the timer held!
+		if (lateKind === "connected") {
+			connectDeferred.resolve({ kind: "connected", link: fakeLink });
+		} else if (lateKind === "status") {
+			capturedHandlers.message({ operationProxy: 1, type: "status", ready: true, connections: 0, inFlight: 0, target: null });
+		} else {
+			capturedHandlers.message({ operationProxy: 1, type: "refused", code: "version" });
+		}
+		await until(w.settled, `timer-held late ${lateKind} settled`);
+		assert.deepEqual(w.value(), { state: "unreachable", proxyCode: "proxy-unreachable" });
+		assert.equal(closedCount, 1, `timer-held late ${lateKind} closed link`);
+	}
+
+	// 4. D54/D55 status() callback protection and 16785408-byte line boundary:
+	let statusReturn = null;
+	let getterCalls = 0;
+	await withCase({ status: () => statusReturn }, async (c) => {
+		const evilGetter = {};
+		Object.defineProperty(evilGetter, "x", { enumerable: true, get() { getterCalls++; return 1; } });
+		for (const bad of [
+			() => { const err = new Error("status-boom"); err.p = Promise.reject(new Error("status-throw-promise")); throw err; },
+			() => evilGetter,
+			() => Promise.reject(new Error("status-returned-promise")),
+			() => ({ p: Promise.reject(new Error("nested-promise")) }),
+			() => ({ [Symbol("s")]: 1 }),
+			() => Number.NaN,
+		]) {
+			statusReturn = bad;
+			await withCase({ status: bad }, async (c2) => {
+				const res = await c2.client.status({ timeMs: 500 });
+				assert.deepEqual(res, { state: "running", ready: true, connections: 0, inFlight: 0, target: null });
+			});
+		}
+		assert.equal(getterCalls, 0, "zero getter calls on status() return value");
+
+		// Exact 16785408-byte status line vs 16785409-byte status line:
+		const emptyLineBytes = Buffer.byteLength(`${JSON.stringify({ operationProxy: 1, type: "status", ready: true, connections: 0, inFlight: 0, target: "" })}\n`, "utf8");
+		const exactTarget = "a".repeat(CHANNEL_LIMITS.lineBytes - emptyLineBytes);
+		statusReturn = exactTarget;
+		const exactRes = await c.client.status({ timeMs: 2000 });
+		assert.equal(exactRes.state, "running");
+		assert.equal(exactRes.target.length, exactTarget.length, "exact 16785408-byte status line preserved target");
+
+		statusReturn = `${exactTarget}b`;
+		const overRes = await c.client.status({ timeMs: 2000 });
+		assert.equal(overRes.state, "running");
+		assert.equal(overRes.target, null, "16785409-byte status line replaced target with null");
+	});
+});
+
+test("PX6 (D8-E1, processes): a real proxy process stopped with SIGSTOP resolves client.status to proxy-unreachable, and after SIGCONT resolves running", { timeout: 60_000 }, async () => {
+	const p = processClient();
+	const pid = await servingPid(p);
+	try {
+		const running1 = await p.client.status({ timeMs: 2000 });
+		assert.equal(running1.state, "running");
+		assert.equal(running1.ready, true);
+		process.kill(pid, "SIGSTOP");
+		const paused = await p.client.status({ timeMs: 300 });
+		assert.deepEqual(paused, { state: "unreachable", proxyCode: "proxy-unreachable" });
+		process.kill(pid, "SIGCONT");
+		const running2 = await p.client.status({ timeMs: 5000 });
+		assert.equal(running2.state, "running");
+		assert.equal(running2.ready, true);
+	} finally {
+		try { process.kill(pid, "SIGCONT"); } catch { /* gone */ }
+		p.client.close();
+	}
 });
 

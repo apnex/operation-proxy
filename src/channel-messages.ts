@@ -50,8 +50,19 @@ export type RefusalCode = "key-mismatch" | "version";
 
 /** client to proxy: the first message on a connection. */
 export interface HelloMessage { readonly operationProxy: 1; readonly type: "hello"; readonly key: ProxyKey }
+/** client to proxy: the first and only message on a status probe connection (PX4, PX5). */
+export interface StatusRequestMessage { readonly operationProxy: 1; readonly type: "status"; readonly key: ProxyKey }
 /** proxy to client: the proxy's caller is ready by the application's own test (PX9). */
 export interface WelcomeMessage { readonly operationProxy: 1; readonly type: "welcome" }
+/** proxy to client: the proxy's status in answer to a valid `status` request, after which the proxy closes (PX4, PX6). */
+export interface StatusReplyMessage {
+	readonly operationProxy: 1;
+	readonly type: "status";
+	readonly ready: boolean;
+	readonly connections: number;
+	readonly inFlight: number;
+	readonly target: JsonValue;
+}
 /** proxy to client: a key other than the proxy's, or a version other than 1; the proxy then closes. */
 export interface RefusedMessage { readonly operationProxy: 1; readonly type: "refused"; readonly code: RefusalCode }
 /** client to proxy: one invocation, for the proxy to hand to its caller (PX5). */
@@ -80,9 +91,9 @@ export interface PartMessage { readonly operationProxy: 1; readonly type: "part"
 export interface AliveMessage { readonly operationProxy: 1; readonly type: "alive"; readonly request: number }
 
 /** A message from a client to a proxy. */
-export type ClientMessage = HelloMessage | InvokeMessage | AbortMessage;
+export type ClientMessage = HelloMessage | StatusRequestMessage | InvokeMessage | AbortMessage;
 /** A message from a proxy to a client. */
-export type ProxyMessage = WelcomeMessage | RefusedMessage | EndMessage | PartMessage | AliveMessage;
+export type ProxyMessage = WelcomeMessage | StatusReplyMessage | RefusedMessage | EndMessage | PartMessage | AliveMessage;
 /** Any message of the channel. */
 export type ChannelMessage = ClientMessage | ProxyMessage;
 
@@ -91,9 +102,19 @@ export function writeHello(key: ProxyKey): HelloMessage {
 	return { operationProxy: 1, type: "hello", key: { application: key.application, identity: key.identity, target: key.target } };
 }
 
+/** Writes a `status` request (PX4, PX5). */
+export function writeStatusRequest(key: ProxyKey): StatusRequestMessage {
+	return { operationProxy: 1, type: "status", key: { application: key.application, identity: key.identity, target: key.target } };
+}
+
 /** Writes a `welcome`. */
 export function writeWelcome(): WelcomeMessage {
 	return { operationProxy: 1, type: "welcome" };
+}
+
+/** Writes a `status` reply (PX4, PX6). */
+export function writeStatusReply(ready: boolean, connections: number, inFlight: number, target: JsonValue): StatusReplyMessage {
+	return { operationProxy: 1, type: "status", ready, connections, inFlight, target };
 }
 
 /** Writes a `refused`. */
@@ -169,6 +190,16 @@ export function readHello(raw: unknown): HelloMessage | undefined {
 	return value as unknown as HelloMessage;
 }
 
+/** Reads an initial `hello` or `status` request; its key's three fields must be strings (PX4). */
+export function readHelloOrStatus(raw: unknown): HelloMessage | StatusRequestMessage | undefined {
+	const value = plainObject(raw);
+	if (value === undefined || (!headed(value, "hello") && !headed(value, "status")) || !hasExactly(value, ["operationProxy", "type", "key"])) return undefined;
+	const key = value.key;
+	if (!isObject(key) || !hasExactly(key, ["application", "identity", "target"])) return undefined;
+	if (typeof key.application !== "string" || typeof key.identity !== "string" || typeof key.target !== "string") return undefined;
+	return value as unknown as HelloMessage | StatusRequestMessage;
+}
+
 /** Reads an `invoke` or an `abort`, the messages a client sends once welcomed. */
 export function readInvokeOrAbort(raw: unknown): InvokeMessage | AbortMessage | undefined {
 	const value = plainObject(raw);
@@ -192,6 +223,20 @@ export function readWelcomeOrRefused(raw: unknown): WelcomeMessage | RefusedMess
 		return value as unknown as RefusedMessage;
 	}
 	return undefined;
+}
+
+/** Reads a `status` reply or a `refused` on a status probe connection (PX4, PX6). */
+export function readStatusOrRefused(raw: unknown): StatusReplyMessage | RefusedMessage | undefined {
+	const value = plainObject(raw);
+	if (value === undefined) return undefined;
+	if (headed(value, "refused") && hasExactly(value, ["operationProxy", "type", "code"]) && (value.code === "key-mismatch" || value.code === "version")) {
+		return value as unknown as RefusedMessage;
+	}
+	if (!headed(value, "status") || !hasExactly(value, ["operationProxy", "type", "ready", "connections", "inFlight", "target"])) return undefined;
+	if (typeof value.ready !== "boolean") return undefined;
+	if (!Number.isSafeInteger(value.connections) || (value.connections as number) < 0) return undefined;
+	if (!Number.isSafeInteger(value.inFlight) || (value.inFlight as number) < 0) return undefined;
+	return value as unknown as StatusReplyMessage;
 }
 
 /** What a client asked of a request it wrote and whose `end` it has not read. */

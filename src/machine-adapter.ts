@@ -54,6 +54,8 @@ export interface ProxiedCaller {
 	readonly caller: CallLayerCaller;
 	/** Stops the caller - its node and its connection - when the proxy stops (PX7). */
 	stop(): Promise<void> | void;
+	/** Optional synchronous callback returning application-specific plain JSON status for `status` replies (PX9). */
+	status?(): unknown;
 }
 
 /** What an application supplies to its proxy on a machine (PX9). */
@@ -262,11 +264,12 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	const held: OwnershipLock = ownership;
 	let server: net.Server | undefined;
 	let callClock: PinnableCallClock;
+	let built: ProxiedCaller | undefined;
 	try {
 		observe("owned");
 		removeLeftover(socketPath);
 		server = await listenChannel(socketPath, accept);
-		half = createProxyHalf({ key, clock, idleMs, onIdle: () => void stopNow(0) });
+		half = createProxyHalf({ key, clock, idleMs, onIdle: () => void stopNow(0), status: () => built?.status?.() });
 		observe("listening");
 		// The call clock reads the clock for its origin, so a clock that fails here fails the start (PX7).
 		callClock = callClockOf(clock);
@@ -431,7 +434,9 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 			if (rootCopy === undefined) return fail();
 			const callerVal = rootCopy.caller;
 			const stopVal = rootCopy.stop;
+			const statusVal = rootCopy.status;
 			if (callerVal === null || typeof callerVal !== "object" || Array.isArray(callerVal) || typeof stopVal !== "function") return fail();
+			if (statusVal !== undefined && typeof statusVal !== "function") return fail();
 			const invokeVal = (callerVal as { readonly invoke?: unknown }).invoke;
 			if (typeof invokeVal !== "function") return fail();
 			return rootCopy as unknown as ProxiedCaller;
@@ -440,7 +445,6 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 			return fail();
 		}
 	};
-	let built: ProxiedCaller | undefined;
 	const building = (async () => {
 		const { value: candidate } = await awaitNative(() => application.buildCaller(key, { clock: callClock }));
 		const validated = validateBuiltCaller(candidate);

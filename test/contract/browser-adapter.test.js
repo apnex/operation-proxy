@@ -912,3 +912,213 @@ test("PX8 (D4-E6): a page taking each part in time keeps its port while more tha
 		r.close();
 	}
 });
+
+test("PX8, PX9 (D8-E1): browser client.status never constructs a SharedWorker when neither openStatusPort nor openPort is supplied, prefers openStatusPort over openPort, maps null/throw/rejection to stopped, carries BrowserProxiedCaller.status(), and crosses 5 s and 15 s boundaries without posting ping or expiring at 15 s", async () => {
+	// 1. Default browser client (no openStatusPort or openPort): SharedWorker constructor spy sees 0 constructions on status().
+	let constructed = 0;
+	const origSharedWorker = globalThis.SharedWorker;
+	globalThis.SharedWorker = class FakeSharedWorker {
+		constructor() {
+			constructed++;
+			this.port = { postMessage() {}, start() {}, close() {} };
+		}
+	};
+	try {
+		const defaultClient = createBrowserClient(
+			{ key: KEY, workerUrl: "https://example.test/worker.js" },
+			{ clock: createManualHopClock(), identities: machineIdentities },
+		);
+		const res = await defaultClient.status({ timeMs: 1000 });
+		assert.deepEqual(res, { state: "stopped" });
+		assert.equal(constructed, 0, "status() never constructs a SharedWorker");
+	} finally {
+		if (origSharedWorker === undefined) delete globalThis.SharedWorker;
+		else globalThis.SharedWorker = origSharedWorker;
+	}
+
+	// 2. openStatusPort precedence over openPort, and openStatusPort / openPort returning null, throwing, or rejecting -> { state: "stopped" }.
+	for (const hookOutcome of ["null", "throw", "reject"]) {
+		let openPortCalls = 0;
+		let statusPortCalls = 0;
+		const cl = createBrowserClient(
+			{ key: KEY, workerUrl: "https://example.test/worker.js" },
+			{
+				clock: createManualHopClock(),
+				identities: machineIdentities,
+				openPort() { openPortCalls++; throw new Error("should not call openPort when openStatusPort is given"); },
+				openStatusPort() {
+					statusPortCalls++;
+					if (hookOutcome === "null") return null;
+					if (hookOutcome === "throw") {
+						const e = new Error("status-hook-throw");
+						e.p = Promise.reject(new Error("observed-sync"));
+						throw e;
+					}
+					return Promise.reject(Object.assign(new Error("status-hook-reject"), { p: Promise.reject(new Error("observed-async")) }));
+				},
+			},
+		);
+		assert.deepEqual(await cl.status({ timeMs: 500 }), { state: "stopped" });
+		assert.equal(statusPortCalls, 1);
+		assert.equal(openPortCalls, 0);
+	}
+
+	// 3. openPort fallback when openStatusPort is omitted, BrowserProxiedCaller.status() callback (including D54/D55 protection), and delayed probe crossing 5 s and 15 s boundaries.
+	const pageClock = createManualHopClock();
+	const workerClock = createManualHopClock();
+	const scope = { onconnect: null };
+	let workerStatus = () => ({ workerNode: "browser-1", connected: true });
+	const proxy = runBrowserProxy(
+		{
+			key: KEY,
+			buildCaller: () => ({
+				caller: { invoke: () => new Promise(() => {}) },
+				status: () => workerStatus(),
+			}),
+			callerReady: () => undefined,
+		},
+		{ clock: workerClock, scope },
+	);
+	try {
+		await proxy.ready;
+		let outboundDelayMs = 0;
+		let returnDelayMs = 0;
+		let dropReply = false;
+		const postedByPage = [];
+		let lastClosed = false;
+		const makePort = () => {
+			const pageListeners = new Set();
+			const workerListeners = new Set();
+			let closed = false;
+			lastClosed = false;
+			const pagePort = {
+				onmessage: null,
+				addEventListener(_t, fn) { pageListeners.add(fn); },
+				removeEventListener(_t, fn) { pageListeners.delete(fn); },
+				start() {},
+				close() { closed = true; lastClosed = true; },
+				postMessage(data) {
+					if (closed) return;
+					const copy = structuredClone(data);
+					postedByPage.push({ atMs: pageClock.elapsedMs(), message: copy });
+					const deliver = () => {
+						if (closed) return;
+						for (const fn of [...workerListeners]) fn({ data: copy });
+						workerPort.onmessage?.({ data: copy });
+					};
+					if (outboundDelayMs <= 0) deliver();
+					else workerClock.schedule(outboundDelayMs, deliver);
+				},
+			};
+			const workerPort = {
+				onmessage: null,
+				addEventListener(_t, fn) { workerListeners.add(fn); },
+				removeEventListener(_t, fn) { workerListeners.delete(fn); },
+				start() {},
+				close() {},
+				postMessage(data) {
+					if (closed) return;
+					const copy = structuredClone(data);
+					if (dropReply && copy?.type === "status") return;
+					const deliver = () => {
+						if (closed) return;
+						for (const fn of [...pageListeners]) fn({ data: copy });
+						pagePort.onmessage?.({ data: copy });
+					};
+					if (returnDelayMs <= 0) deliver();
+					else pageClock.schedule(returnDelayMs, deliver);
+				},
+			};
+			scope.onconnect?.({ ports: [workerPort] });
+			return pagePort;
+		};
+		let usedStatusHook = 0;
+		const client = createBrowserClient(
+			{ key: KEY, workerUrl: "https://example.test/worker.js" },
+			{
+				clock: pageClock,
+				identities: machineIdentities,
+				openPort: () => { throw new Error("openStatusPort should take precedence"); },
+				openStatusPort: () => { usedStatusHook++; return makePort(); },
+			},
+		);
+		const st1 = await client.status({ timeMs: 1000 });
+		assert.deepEqual(st1, {
+			state: "running",
+			ready: true,
+			connections: 0,
+			inFlight: 0,
+			target: { workerNode: "browser-1", connected: true },
+		});
+		assert.equal(usedStatusHook, 1);
+		assert.equal(lastClosed, true, "status port closed on settlement");
+
+		// D54/D55 protection on BrowserProxiedCaller.status():
+		let getterCalled = 0;
+		const badObj = {};
+		Object.defineProperty(badObj, "a", { enumerable: true, get() { getterCalled++; return 1; } });
+		workerStatus = () => badObj;
+		const stBad = await client.status({ timeMs: 1000 });
+		assert.equal(stBad.target, null);
+		assert.equal(getterCalled, 0);
+		workerStatus = () => ({ workerNode: "browser-1", connected: true });
+
+		// Delayed probe with timeMs: 20_000 and returnDelayMs: 16_000 crosses 5 s and 15 s boundaries without posting ping or expiring at 15 s:
+		postedByPage.length = 0;
+		returnDelayMs = 16_000;
+		const delayed = watch(client.status({ timeMs: 20_000 }));
+		await settle();
+		for (let elapsed = 0; elapsed < 15_000; elapsed += 1000) {
+			pageClock.advance(1000);
+			workerClock.advance(1000);
+			await settle(2);
+		}
+		pageClock.advance(500);
+		workerClock.advance(500);
+		await settle(2);
+		assert.equal(delayed.settled(), false, "did not expire at 15.5 s silence boundary");
+		assert.deepEqual(postedByPage.map((p) => p.message.type), ["status"], "zero ping messages posted by status probe port across 5 s, 10 s, 15 s");
+		pageClock.advance(500);
+		workerClock.advance(500);
+		await until(delayed.settled, "settled at 16 s when reply arrived");
+		assert.equal(delayed.value().state, "running");
+		assert.equal(lastClosed, true);
+
+		// Unanswered probe with timeMs: 20_000 settles proxy-unreachable at 20 s, not 15 s:
+		returnDelayMs = 0;
+		dropReply = true;
+		const unanswered = watch(client.status({ timeMs: 20_000 }));
+		await settle();
+		for (let elapsed = 0; elapsed < 19_000; elapsed += 1000) {
+			pageClock.advance(1000);
+			workerClock.advance(1000);
+			await settle(2);
+		}
+		pageClock.advance(900);
+		workerClock.advance(900);
+		await settle(2);
+		assert.equal(unanswered.settled(), false, "still waiting at 19.9 s");
+		pageClock.advance(100);
+		workerClock.advance(100);
+		await until(unanswered.settled, "timed out at 20 s deadline");
+		assert.deepEqual(unanswered.value(), { state: "unreachable", proxyCode: "proxy-unreachable" });
+		assert.equal(lastClosed, true);
+
+		// openPort fallback when openStatusPort is omitted:
+		dropReply = false;
+		let usedOpenPortFallback = 0;
+		const fallbackClient = createBrowserClient(
+			{ key: KEY, workerUrl: "https://example.test/worker.js" },
+			{
+				clock: pageClock,
+				identities: machineIdentities,
+				openPort: () => { usedOpenPortFallback++; return makePort(); },
+			},
+		);
+		const fallbackStatus = await fallbackClient.status({ timeMs: 1000 });
+		assert.equal(fallbackStatus.state, "running");
+		assert.equal(usedOpenPortFallback, 1, "openPort fallback used when openStatusPort is omitted");
+	} finally {
+		proxy.close();
+	}
+});

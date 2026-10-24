@@ -53,10 +53,13 @@ export async function openHop(options) {
 	const wire = [];
 	const writes = [];
 	const proxyLinks = [];
+	const openSockets = new Set();
 	const half = createProxyHalf({ key: KEY, clock, idleMs: options.idleMs ?? 86_400_000, onIdle: options.onIdle ?? (() => undefined), status: options.status });
 	const inbound = options.inbound ?? ((_value, deliver) => deliver());
 	const outbound = options.outbound ?? ((_message, write) => write());
 	const server = await listenChannel(socketPath, (socket) => {
+		openSockets.add(socket);
+		socket.on("close", () => openSockets.delete(socket));
 		let handlers;
 		const link = socketLink(socket, {
 			message: (value) => { wire.push({ to: "proxy", message: value }); inbound(value, () => handlers.message(value)); },
@@ -91,6 +94,7 @@ export async function openHop(options) {
 	return {
 		t, clock, client, half, calls, wire, writes, socketPath, dir, ready, server, proxyLinks,
 		launches: () => launches,
+		openSockets: () => openSockets.size,
 		/** The messages of one type on the wire, in order. */
 		sent: (type) => wire.filter((w) => w.message?.type === type).map((w) => w.message),
 		async close() {

@@ -428,7 +428,7 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 				conn.link.write(writeWelcome());
 			}
 		},
-		connections: () => conns.size + helloConns.size,
+		connections: () => conns.size,
 		inFlight: () => inFlight,
 		drained: () => inFlight === 0 ? Promise.resolve() : new Promise<void>((resolve) => { drainWaiters.push(resolve); }),
 		stopIdle(): void {

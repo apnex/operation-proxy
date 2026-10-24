@@ -2284,7 +2284,7 @@ test("PX5, PX6, PX9 (D8-E1): client.status option and getter validation, pending
 		assert.deepEqual(await cl.status({ timeMs: 100 }), { state: "unreachable", proxyCode: expectedCode });
 	}
 
-	// 3. Refusal codes (key-mismatch and version), early timer wake re-arming, and timer-held late connected/status/refused outcomes.
+	// 3. Refusal codes (key-mismatch and version before the deadline), abort after connected while awaiting reply, early timer wake re-arming, and timer-held late connected/status/refused outcomes.
 	await withCase({}, async (c) => {
 		const wrongKeyClient = createProxyClient({
 			key: { application: "fixture", identity: "other", target: KEY.target },
@@ -2294,6 +2294,60 @@ test("PX5, PX6, PX9 (D8-E1): client.status option and getter validation, pending
 		});
 		assert.deepEqual(await wrongKeyClient.status({ timeMs: 500 }), { state: "unreachable", proxyCode: "key-mismatch" });
 	});
+
+	// Timely version refusal before the deadline closes link and resolves { state: "unreachable", proxyCode: "version" }:
+	{
+		let versionLinkClosed = false;
+		let versionHandlers;
+		const versionClient = createProxyClient({
+			key: KEY,
+			clock: createManualHopClock(),
+			identities: machineIdentities,
+			connector: {
+				connect: async (h) => {
+					versionHandlers = h;
+					return {
+						kind: "connected",
+						link: {
+							write: () => {
+								queueMicrotask(() => versionHandlers.message({ operationProxy: 1, type: "refused", code: "version" }));
+								return true;
+							},
+							close: () => { versionLinkClosed = true; },
+							hold: () => undefined,
+						},
+					};
+				},
+				launch: () => undefined,
+			},
+		});
+		assert.deepEqual(await versionClient.status({ timeMs: 500 }), { state: "unreachable", proxyCode: "version" });
+		assert.equal(versionLinkClosed, true, "timely version refusal closed link");
+	}
+
+	// Abort after connected while awaiting status reply closes link and rejects with signal.reason:
+	{
+		let awaitingLinkClosed = false;
+		const awaitingAbort = new AbortController();
+		const awaitingReason = new Error("abort-awaiting-reply");
+		const awaitingClient = createProxyClient({
+			key: KEY,
+			clock: createManualHopClock(),
+			identities: machineIdentities,
+			connector: {
+				connect: async () => ({
+					kind: "connected",
+					link: { write: () => true, close: () => { awaitingLinkClosed = true; }, hold: () => undefined },
+				}),
+				launch: () => undefined,
+			},
+		});
+		const awaitingPromise = awaitingClient.status({ timeMs: 1000, signal: awaitingAbort.signal });
+		await settle();
+		awaitingAbort.abort(awaitingReason);
+		await assert.rejects(() => awaitingPromise, (err) => err === awaitingReason);
+		assert.equal(awaitingLinkClosed, true, "abort while awaiting reply closed link");
+	}
 
 	// Early timer wake (earlyMs: 200) re-arms and still accepts reply before 500 ms deadline:
 	const earlyClock = createManualHopClock({ earlyMs: 200 });

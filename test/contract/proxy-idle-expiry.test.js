@@ -99,12 +99,13 @@ test("a client connecting as the idle timer falls due keeps the proxy: on firing
 	await idleCase(async (c, idled) => {
 		c.clock.move(1000);
 		const raw = await rawConnection(c.hop.socketPath);
-		await until(() => c.hop.half.connections() === 1, "the connection accepted");
+		await until(() => c.hop.openSockets() === 1, "the connection accepted");
+		assert.equal(c.hop.half.connections(), 0, "pre-hello connection is in helloConns, excluded from half.connections()");
 		c.clock.advance(0);
 		c.clock.advance(5000);
 		assert.equal(idled(), 0, "the proxy stays while the connection is open");
 		raw.end();
-		await until(() => c.hop.half.connections() === 0, "the connection closed");
+		await until(() => c.hop.openSockets() === 0, "the connection closed");
 		c.clock.advance(1000);
 		assert.equal(idled(), 1);
 	});
@@ -818,12 +819,13 @@ test("PX7 (D8-E1): client.status and raw-channel valid, refused, malformed, empt
 		c.clock.advance(100);
 		// Overlapping pre-hello probes: one empty probe held open while a client.status runs and closes, then the empty probe closes at t = 900 ms.
 		const heldProbe = await rawConnection(c.hop.socketPath);
-		await until(() => c.hop.half.connections() === 1, "held pre-hello probe accepted");
+		await until(() => c.hop.openSockets() === 1, "held pre-hello probe accepted");
+		assert.equal(c.hop.half.connections(), 0, "half.connections() excludes pre-hello probes in helloConns");
 		const s2 = await c.client.status({ timeMs: 500 });
 		assert.deepEqual(s2, { state: "running", ready: true, connections: 0, inFlight: 0, target: null }, "connections excludes pre-hello probes");
 		c.clock.advance(100);
 		heldProbe.end();
-		await until(() => c.hop.half.connections() === 0, "held pre-hello probe closed");
+		await until(() => c.hop.openSockets() === 0, "held pre-hello probe closed");
 		// At t = 900 ms, 99 ms more is 999 ms (still alive), and 1 ms more is 1000 ms (original deadline expires!).
 		c.clock.advance(99);
 		assert.equal(idled(), 0, "still alive at 999 ms");
@@ -836,17 +838,19 @@ test("PX7 (D8-E1): client.status and raw-channel valid, refused, malformed, empt
 		await c.hop.ready;
 		c.clock.advance(200);
 		assert.equal(await c.client.prepare({ timeMs: 500 }), "ready");
+		assert.equal(c.hop.half.connections(), 1, "welcomed client counted in half.connections()");
 		c.clock.advance(300);
 		// Open a pre-hello probe at t = 500 ms while the real client is still connected.
 		const probe = await rawConnection(c.hop.socketPath);
-		await until(() => c.hop.half.connections() === 2, "both real client and pre-hello probe open");
+		await until(() => c.hop.openSockets() === 2, "both real client and pre-hello probe open");
+		assert.equal(c.hop.half.connections(), 1, "half.connections() still 1 while pre-hello probe is open");
 		// Close the real client at t = 500 ms: conns.size becomes 0 while helloConns.size is 1, establishing idleDeadlineNs = 1500 ms!
 		c.client.close();
-		await until(() => c.hop.half.connections() === 1, "real client closed while probe stays open");
+		await until(() => c.hop.half.connections() === 0 && c.hop.openSockets() === 1, "real client closed while probe stays open");
 		c.clock.advance(300);
 		// Close the probe at t = 800 ms: deadline must still be 1500 ms (700 ms remaining), not 1800 ms!
 		probe.end();
-		await until(() => c.hop.half.connections() === 0, "probe closed at 800 ms");
+		await until(() => c.hop.openSockets() === 0, "probe closed at 800 ms");
 		c.clock.advance(699);
 		assert.equal(idled(), 0, "alive at 1499 ms");
 		c.clock.advance(1);

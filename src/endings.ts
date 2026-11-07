@@ -12,8 +12,8 @@
 import { readCallEnding, readRefusalRecord, type CallLayerEnding, type CallLayerUnknownReason, type DeliveryReport, type HopNotDeliveredEnding, type HopUnknownEnding, type HopUnknownReason, type JsonValue, type RefusalRecord } from "@apnex/operation-call";
 import { crossesAgp, isAttemptId, isInvocationId, NAME_PATTERN, readMessage, writeEnd, type EndContent } from "@apnex/operation-call/message-format";
 
-/** The proxy's codes on a `not-delivered` ending (PX2, PX5, PX6, PX7). */
-export type ProxyCode = "proxy-unreachable" | "key-mismatch" | "version" | "deadline-passed" | "runtime-dir-unsafe" | "proxy-stopping";
+/** The proxy's codes on a `not-delivered` ending (PX2, PX4, PX5, PX6, PX7, PX9). */
+export type ProxyCode = "proxy-unreachable" | "key-mismatch" | "version" | "deadline-passed" | "runtime-dir-unsafe" | "proxy-stopping" | "admission-refused";
 
 /** The hop's reasons on an `unknown` ending the client half decides (PX6): the reasons a hop adds (EM12). */
 export type HopReason = HopUnknownReason;
@@ -49,14 +49,14 @@ export type { HopUnknownEnding };
  */
 export type ProxiedEnding = CallLayerEnding | ProxyNotDeliveredEnding | HopUnknownEnding;
 
-/** The proxy's own ending in an `end` message: `deadline-passed` (PX5), or `proxy-stopping` (PX7). */
-export type DeadlinePassedEnding = ProxyNotDeliveredEnding & { readonly proxyCode: "deadline-passed" | "proxy-stopping" };
+/** The proxy's own ending in an `end` message: `deadline-passed` (PX5), `proxy-stopping` (PX7), or `admission-refused` (PX6, PX9). */
+export type DeadlinePassedEnding = ProxyNotDeliveredEnding & { readonly proxyCode: "deadline-passed" | "proxy-stopping" | "admission-refused" };
 
-/** The ending the proxy itself writes in an `end` message: the call layer's, or its `deadline-passed` or `proxy-stopping`. */
+/** The ending the proxy itself writes in an `end` message: the call layer's, or its `deadline-passed`, `proxy-stopping` or `admission-refused`. */
 export type CarriedEnding = CallLayerEnding | DeadlinePassedEnding;
 
-/** The proxy's codes an `end` message may carry, on a `not-delivered` ending of its own (PX6). */
-const CARRIED_PROXY_CODES: readonly ProxyCode[] = ["deadline-passed", "proxy-stopping"];
+/** The proxy's codes an `end` message may carry, on a `not-delivered` ending of its own (PX6, PX9). */
+const CARRIED_PROXY_CODES: readonly ProxyCode[] = ["deadline-passed", "proxy-stopping", "admission-refused"];
 
 const UNKNOWN_REASONS: readonly CallLayerUnknownReason[] = ["bound-passed", "operation-failed", "answer-not-sendable", "part-missing"];
 

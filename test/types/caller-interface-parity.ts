@@ -59,6 +59,6 @@ holds<ProxiedEnding extends CallEnding ? true : false>();
 holds<Same<Awaited<ReturnType<ProxyClient["invoke"]>>, ProxiedEnding>>();
 holds<Same<Extract<ProxiedEnding, { readonly attempt: null }>["ending"], "not-delivered" | "unknown">>();
 holds<Same<Extract<ProxiedEnding, { readonly ending: "unknown"; readonly attempt: null }>["reason"], "proxy-lost" | "hop-stalled">>();
-holds<Same<Extract<ProxiedEnding, { readonly ending: "not-delivered"; readonly attempt: null }>["proxyCode"], "proxy-unreachable" | "key-mismatch" | "version" | "deadline-passed" | "runtime-dir-unsafe" | "proxy-stopping">>();
+holds<Same<Extract<ProxiedEnding, { readonly ending: "not-delivered"; readonly attempt: null }>["proxyCode"], "proxy-unreachable" | "key-mismatch" | "version" | "deadline-passed" | "runtime-dir-unsafe" | "proxy-stopping" | "admission-refused">>();
 // Preparing is not invoking: its ending may name no invocation, so it is not an ending of the interface.
 holds<PreparingEnding extends CallEnding ? false : true>();

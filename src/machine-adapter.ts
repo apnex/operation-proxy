@@ -20,7 +20,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import type { CallClock, IdentitySource } from "@apnex/operation-call";
-import { observePromises } from "@apnex/shape-check";
+import { observePromises, readPlainJson } from "@apnex/shape-check";
 import type { LinkHandlers } from "./channel-link.js";
 import { CHANNEL_LIMITS } from "./channel-messages.js";
 import { createProxyClient, checkHopAllowance, DEFAULT_HOP_ALLOWANCE_MS, type ProxyClient } from "./client-half.js";
@@ -48,6 +48,9 @@ export interface MachineClientApplication {
 	readonly hopAllowanceMs?: number;
 }
 
+/** What `callerReady` may settle to (PX9; zorg's D71, D75). */
+export type CallerReadyResult = void | { readonly refused: "admission-refused" };
+
 /** The proxy's caller, as the application builds it from the key (PX1, PX9). */
 export interface ProxiedCaller {
 	/** One caller of the call layer, with its one connection to the target. */
@@ -56,6 +59,8 @@ export interface ProxiedCaller {
 	stop(): Promise<void> | void;
 	/** Optional synchronous callback returning application-specific plain JSON status for `status` replies (PX9). */
 	status?(): unknown;
+	/** Optional synchronous callback checked before handing an `invoke` to `caller.invoke` (PX6, PX9; zorg's D71, D75). */
+	invocationRefusal?(): "admission-refused" | null | undefined;
 }
 
 /** What an application supplies to its proxy on a machine (PX9). */
@@ -68,8 +73,8 @@ export interface MachineProxyApplication {
 	 * bound on the clock the deadline crossed on (PX5).
 	 */
 	buildCaller(key: ProxyKey, ports: { readonly clock: CallClock }): Promise<ProxiedCaller> | ProxiedCaller;
-	/** The application's test of when that caller is ready: resolves once it is, and the proxy then welcomes. */
-	callerReady(built: ProxiedCaller): Promise<void> | void;
+	/** The application's test of when that caller is ready: resolves once it is, and the proxy then welcomes (or refuses startup when `{ refused: "admission-refused" }`). */
+	callerReady(built: ProxiedCaller): Promise<CallerReadyResult> | CallerReadyResult;
 }
 
 /** A moment in a proxy's life, reported to an observer as it happens. */
@@ -269,7 +274,7 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 		observe("owned");
 		removeLeftover(socketPath);
 		server = await listenChannel(socketPath, accept);
-		half = createProxyHalf({ key, clock, idleMs, onIdle: () => void stopNow(0), status: () => built?.status?.() });
+		half = createProxyHalf({ key, clock, idleMs, onIdle: () => void stopNow(0), status: () => built?.status?.(), invocationRefusal: () => built?.invocationRefusal?.() });
 		observe("listening");
 		// The call clock reads the clock for its origin, so a clock that fails here fails the start (PX7).
 		callClock = callClockOf(clock);
@@ -435,8 +440,10 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 			const callerVal = rootCopy.caller;
 			const stopVal = rootCopy.stop;
 			const statusVal = rootCopy.status;
+			const invocationRefusalVal = rootCopy.invocationRefusal;
 			if (callerVal === null || typeof callerVal !== "object" || Array.isArray(callerVal) || typeof stopVal !== "function") return fail();
 			if (statusVal !== undefined && typeof statusVal !== "function") return fail();
+			if (invocationRefusalVal !== undefined && typeof invocationRefusalVal !== "function") return fail();
 			const invokeVal = (callerVal as { readonly invoke?: unknown }).invoke;
 			if (typeof invokeVal !== "function") return fail();
 			return rootCopy as unknown as ProxiedCaller;
@@ -457,10 +464,23 @@ export async function startMachineProxyIn(dir: string, application: MachineProxy
 	})();
 	building.then(async (caller) => {
 		const { value: readyValue } = await awaitNative(() => application.callerReady(caller));
-		// PX9, Amendment 2 item 1: callerReady completes when it settles to undefined; anything else fails startup.
+		// PX9: callerReady completes when it settles to undefined or { refused: "admission-refused" }; anything else fails startup.
 		if (readyValue !== undefined) {
+			const plain = readPlainJson(readyValue);
+			const isRefused = plain.ok
+				&& plain.value !== null
+				&& typeof plain.value === "object"
+				&& !Array.isArray(plain.value)
+				&& Object.keys(plain.value).length === 1
+				&& (plain.value as { readonly refused?: unknown }).refused === "admission-refused";
+			if (isRefused) {
+				if (stopping) return;
+				proxyHalf.refuseStartup("admission-refused");
+				void stopNow(0);
+				return;
+			}
 			observePromises(readyValue);
-			throw new TypeError("callerReady must settle to undefined");
+			throw new TypeError("callerReady must settle to undefined or { refused: \"admission-refused\" }");
 		}
 		if (stopping) return;
 		proxyHalf.ready(caller.caller, callClock);

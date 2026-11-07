@@ -1122,3 +1122,69 @@ test("PX8, PX9 (D8-E1): browser client.status never constructs a SharedWorker wh
 		proxy.close();
 	}
 });
+
+test("PX4, PX6, PX8, PX9 (D11-E2): runBrowserProxy handles callerReady resolving { refused: \"admission-refused\" } (refusing waiting and subsequent ports, calling built.stop, and resolving ready to false) and invocationRefusal() returning \"admission-refused\"", async () => {
+	let releaseReady;
+	const readiness = new Promise((r) => { releaseReady = r; });
+	let stoppedCount = 0;
+	const rig = openBrowserRig({
+		readiness,
+		buildCaller: () => ({
+			caller: { invoke: () => { throw new Error("never called"); } },
+			stop: () => { stoppedCount++; },
+		}),
+	});
+	try {
+		const waiting = watch(rig.client.invoke({ host: "host-a", service: "svc", operation: "echo", input: 1, bound: 1000 }));
+		await settle(10);
+		releaseReady({ refused: "admission-refused" });
+		assert.equal(await rig.proxy.ready, false, "BrowserProxy.ready resolves false on admission-refused");
+		assert.equal(stoppedCount, 1, "built.stop() called on browser startup refusal");
+		await until(waiting.settled, "waiting browser invoke settles on admission-refused");
+		assert.equal(waiting.value().ending, "not-delivered");
+		assert.equal(waiting.value().proxyCode, "admission-refused");
+
+		// A new invocation / tab connecting after callerReady refusal still receives admission-refused until proxy.close():
+		const late = await rig.client.invoke({ host: "host-a", service: "svc", operation: "echo", input: 2, bound: 1000 });
+		assert.equal(late.ending, "not-delivered");
+		assert.equal(late.proxyCode, "admission-refused");
+	} finally {
+		rig.close();
+	}
+
+	// Browser invocationRefusal() check after readiness:
+	let refuseInvoke = true;
+	let invokeCount = 0;
+	const rig2 = openBrowserRig({
+		buildCaller: () => ({
+			caller: {
+				invoke: async (call) => {
+					invokeCount++;
+					return {
+						ending: "answered",
+						invocation: call.invocation,
+						attempt: `${call.invocation}.00000001`,
+						operation: call.operation,
+						answer: call.input,
+					};
+				},
+			},
+			invocationRefusal: () => (refuseInvoke ? "admission-refused" : null),
+		}),
+	});
+	try {
+		assert.equal(await rig2.proxy.ready, true);
+		const r1 = await rig2.client.invoke({ host: "host-a", service: "svc", operation: "echo", input: "x", bound: 1000 });
+		assert.equal(r1.ending, "not-delivered");
+		assert.equal(r1.proxyCode, "admission-refused");
+		assert.equal(invokeCount, 0);
+
+		refuseInvoke = false;
+		const r2 = await rig2.client.invoke({ host: "host-a", service: "svc", operation: "echo", input: "ok", bound: 1000 });
+		assert.equal(r2.ending, "answered");
+		assert.equal(r2.answer, "ok");
+		assert.equal(invokeCount, 1);
+	} finally {
+		rig2.close();
+	}
+});

@@ -382,6 +382,7 @@ export class Preparer {
 			};
 			const drop = (attempt: Attempt): void => {
 				route.message = () => undefined;
+				route.closed = () => this.#links.delete(link);
 				guarded(() => link.close());
 				finish(attempt);
 			};

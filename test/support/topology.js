@@ -53,12 +53,15 @@ export async function openTopology(options = {}) {
 	const capacity = { maxSessions: 4, maxPendingHandshakes: 4 };
 	const timers = { holdTimeMs: 0 };
 	const hostDisposition = options.holdDeliveryReports ? { debounceMs: 60_000, maximumOutcomes: 1_000_000 } : { debounceMs: 0 };
-	const hostNode = (id) => createNode({ nodeId: id, listen: { transportRef: "listen" }, capacity, timers, disposition: hostDisposition }, { clock: agpClock, transport: port(id, true, []) });
+	const identityAdmission = options.identityAdmission ?? {
+		evaluate: async () => ({ decision: "allow", authorizationAssociation: { mode: "unauthenticated" } }),
+	};
+	const hostNode = (id) => createNode({ nodeId: id, listen: { transportRef: "listen" }, capacity, timers, disposition: hostDisposition }, { clock: agpClock, transport: port(id, true, []), identityAdmission });
 	const hosts = [{ nodeId: "host-a", node: hostNode("host-a") }, { nodeId: "host-b", node: hostNode("host-b") }];
 	const reconnect = { initialDelayMs: 10, maximumDelayMs: 10 };
 	const callerNode = createNode({ nodeId: "proxy", capacity, timers, disposition: { debounceMs: 0 }, peers: hosts.map((h) => ({
 		adjacencyId: h.nodeId, expectedNodeId: h.nodeId, transportRef: h.nodeId, reconnect,
-	})) }, { clock: agpClock, transport: port("proxy", false, hosts.map((h) => h.nodeId)) });
+	})) }, { clock: agpClock, transport: port("proxy", false, hosts.map((h) => h.nodeId)), identityAdmission });
 	const nodes = new Map([["proxy", callerNode], ...hosts.map((h) => [h.nodeId, h.node])]);
 
 	const reports = [];

@@ -45,8 +45,10 @@ export const CHANNEL_LIMITS = Object.freeze({
 	unwrittenBytes: 2 * (MESSAGE_LIMITS.requestBytes + 8192),
 });
 
-/** The codes of a `refused` message. */
-export type RefusalCode = "key-mismatch" | "version";
+/** The codes of a `refused` message (PX4, PX6, PX9). */
+export type RefusalCode = "key-mismatch" | "version" | "admission-refused";
+
+const REFUSED_CODES: readonly RefusalCode[] = ["key-mismatch", "version", "admission-refused"];
 
 /** client to proxy: the first message on a connection. */
 export interface HelloMessage { readonly operationProxy: 1; readonly type: "hello"; readonly key: ProxyKey }
@@ -219,18 +221,18 @@ export function readWelcomeOrRefused(raw: unknown): WelcomeMessage | RefusedMess
 	const value = plainObject(raw);
 	if (value === undefined) return undefined;
 	if (headed(value, "welcome")) return hasExactly(value, ["operationProxy", "type"]) ? value as unknown as WelcomeMessage : undefined;
-	if (headed(value, "refused") && hasExactly(value, ["operationProxy", "type", "code"]) && (value.code === "key-mismatch" || value.code === "version")) {
+	if (headed(value, "refused") && hasExactly(value, ["operationProxy", "type", "code"]) && REFUSED_CODES.includes(value.code as RefusalCode)) {
 		return value as unknown as RefusedMessage;
 	}
 	return undefined;
 }
 
 /** Reads a `status` reply or a `refused` on a status probe connection (PX4, PX6). */
-export function readStatusOrRefused(raw: unknown): StatusReplyMessage | RefusedMessage | undefined {
+export function readStatusOrRefused(raw: unknown): StatusReplyMessage | (RefusedMessage & { readonly code: "key-mismatch" | "version" }) | undefined {
 	const value = plainObject(raw);
 	if (value === undefined) return undefined;
 	if (headed(value, "refused") && hasExactly(value, ["operationProxy", "type", "code"]) && (value.code === "key-mismatch" || value.code === "version")) {
-		return value as unknown as RefusedMessage;
+		return value as unknown as RefusedMessage & { readonly code: "key-mismatch" | "version" };
 	}
 	if (!headed(value, "status") || !hasExactly(value, ["operationProxy", "type", "ready", "connections", "inFlight", "target"])) return undefined;
 	if (typeof value.ready !== "boolean") return undefined;

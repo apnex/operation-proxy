@@ -82,19 +82,24 @@ export interface BrowserClientOptions {
 	readonly openStatusPort?: (workerUrl: string, name: string) => BrowserMessagePort | null | Promise<BrowserMessagePort | null>;
 }
 
+/** What `callerReady` may settle to (PX9; zorg's D71, D75). */
+export type CallerReadyResult = void | { readonly refused: "admission-refused" };
+
 /** The proxy's caller in a browser worker (PX1, PX8, PX9). */
 export interface BrowserProxiedCaller {
 	readonly caller: CallLayerCaller;
 	stop?(): Promise<void> | void;
 	/** Optional synchronous callback returning application-specific plain JSON status for `status` replies (PX9). */
 	status?(): unknown;
+	/** Optional synchronous callback checked before handing an `invoke` to `caller.invoke` (PX6, PX9; zorg's D71, D75). */
+	invocationRefusal?(): "admission-refused" | null | undefined;
 }
 
 /** What an application supplies to its proxy in a browser `SharedWorker` (PX8, PX9). */
 export interface BrowserProxyApplication {
 	readonly key: ProxyKey;
 	buildCaller(key: ProxyKey, ports: { readonly clock: CallClock }): Promise<BrowserProxiedCaller> | BrowserProxiedCaller;
-	callerReady(built: BrowserProxiedCaller): Promise<void> | void;
+	callerReady(built: BrowserProxiedCaller): Promise<CallerReadyResult> | CallerReadyResult;
 }
 
 /** Ports for a proxy running in a browser `SharedWorker`. */
@@ -547,9 +552,11 @@ function validateBrowserCaller(candidate: unknown): BrowserProxiedCaller | undef
 		const callerVal = rootCopy.caller;
 		const stopVal = rootCopy.stop;
 		const statusVal = rootCopy.status;
+		const invocationRefusalVal = rootCopy.invocationRefusal;
 		if (callerVal === null || typeof callerVal !== "object" || Array.isArray(callerVal)) return fail();
 		if (stopVal !== undefined && typeof stopVal !== "function") return fail();
 		if (statusVal !== undefined && typeof statusVal !== "function") return fail();
+		if (invocationRefusalVal !== undefined && typeof invocationRefusalVal !== "function") return fail();
 		const invokeVal = (callerVal as { readonly invoke?: unknown }).invoke;
 		if (typeof invokeVal !== "function") return fail();
 		return rootCopy as unknown as BrowserProxiedCaller;
@@ -576,7 +583,7 @@ export function runBrowserProxy(application: BrowserProxyApplication, options: B
 	let builtCaller: BrowserProxiedCaller | undefined;
 	// In a browser, the browser starts the worker for the first page and ends it after the last, so there is no
 	// idle timer (PX8); we pass the maximum idleMs and stop the proxy half's idle timer at once.
-	const half: ProxyHalf = createProxyHalf({ key, clock, idleMs: 86_400_000, onIdle: () => undefined, status: () => builtCaller?.status?.() });
+	const half: ProxyHalf = createProxyHalf({ key, clock, idleMs: 86_400_000, onIdle: () => undefined, status: () => builtCaller?.status?.(), invocationRefusal: () => builtCaller?.invocationRefusal?.() });
 	half.stopIdle();
 	const links = new Set<ChannelLink>();
 	let failed = false;
@@ -653,8 +660,25 @@ export function runBrowserProxy(application: BrowserProxyApplication, options: B
 			builtCaller = built;
 			const { value: readyValue } = await awaitNative(() => application.callerReady(built));
 			if (readyValue !== undefined) {
+				const plain = readPlainJson(readyValue);
+				const isRefused = plain.ok
+					&& plain.value !== null
+					&& typeof plain.value === "object"
+					&& !Array.isArray(plain.value)
+					&& Object.keys(plain.value).length === 1
+					&& (plain.value as { readonly refused?: unknown }).refused === "admission-refused";
+				if (isRefused) {
+					if (failed) return false;
+					half.refuseStartup("admission-refused");
+					try {
+						await awaitNative(() => built.stop?.());
+					} catch (stopErr) {
+						observePromises(stopErr);
+					}
+					return false;
+				}
 				observePromises(readyValue);
-				throw new TypeError("callerReady must settle to undefined");
+				throw new TypeError("callerReady must settle to undefined or { refused: \"admission-refused\" }");
 			}
 			if (failed) return false;
 			half.ready(built.caller, callClock);

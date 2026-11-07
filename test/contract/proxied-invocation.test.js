@@ -2471,3 +2471,185 @@ test("PX6 (D8-E1, processes): a real proxy process stopped with SIGSTOP resolves
 	}
 });
 
+test("PX4, PX6, PX9 (D11-E2): callerReady resolving { refused: \"admission-refused\" } latches terminal startup refusal (answering waiting and late hello connections with refused admission-refused before stopping on a machine), and invocationRefusal() returning \"admission-refused\" answers end not-delivered admission-refused without calling caller.invoke", { timeout: 60_000 }, async () => {
+	const { createMachineClientIn, startMachineProxyIn } = await import("../../dist/machine-adapter.js");
+	const dir = shortTempDir();
+	const unhandled = [];
+	const onUnhandled = (r) => unhandled.push(r);
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		// 1. Machine startup refusal via callerReady -> { refused: "admission-refused" }:
+		let releaseReady;
+		const readyGate = new Promise((r) => { releaseReady = r; });
+		let stoppedCaller = 0;
+		const proxy = await startMachineProxyIn(dir, {
+			key: KEY,
+			idleMs: 60_000,
+			buildCaller: () => ({
+				caller: { invoke: () => { throw new Error("never called"); } },
+				stop: () => { stoppedCaller++; },
+			}),
+			callerReady: async () => {
+				await readyGate;
+				return { refused: "admission-refused" };
+			},
+		});
+		const client = createMachineClientIn(dir, { key: KEY, launch: { command: process.execPath, args: ["-e", "process.exit(0)"] } });
+		const pendingPrepare = watch(client.prepare({ timeMs: 5000, invocation: "1791540000000-0123456789abcdef", operation: "echo", repeat: true }));
+		const pendingInvoke = watch(client.invoke({ host: "host-a", service: "svc", operation: "echo", input: {}, bound: 5000, invocation: "1791540000000-fedcba9876543210" }));
+		await settle(10);
+		releaseReady();
+		await until(() => pendingPrepare.settled() && pendingInvoke.settled(), "waiting prepare and invoke settle on admission-refused");
+		assert.deepEqual(pendingPrepare.value(), {
+			ending: "not-delivered",
+			invocation: "1791540000000-0123456789abcdef",
+			attempt: null,
+			operation: "echo",
+			agpCode: null,
+			proxyCode: "admission-refused",
+			earlierAttemptsUncertain: true,
+		});
+		assert.deepEqual(pendingInvoke.value(), {
+			ending: "not-delivered",
+			invocation: "1791540000000-fedcba9876543210",
+			attempt: null,
+			operation: "echo",
+			agpCode: null,
+			proxyCode: "admission-refused",
+			earlierAttemptsUncertain: false,
+		});
+		const exitCode = await proxy.stopped;
+		assert.equal(exitCode, 0, "clean shutdown on admission-refused");
+		assert.equal(stoppedCaller, 1, "built.stop() called during clean shutdown");
+		client.close();
+
+		// 2. Direct ProxyHalf refuseStartup("admission-refused") latches terminal state (ready() becomes no-op, late hello receives refused admission-refused, status stays ready: false) and invocationRefusal() pre-invocation check:
+		const clock = createManualHopClock();
+		let refusalMode = null;
+		let invokeCalls = 0;
+		let refusalGetters = 0;
+		const half = createProxyHalf({
+			key: KEY,
+			clock,
+			idleMs: 60_000,
+			onIdle: () => {},
+			invocationRefusal: () => {
+				if (refusalMode === "throw") {
+					const err = new Error("refusal-throw");
+					err.p = Promise.reject(new Error("refusal-throw-promise"));
+					throw err;
+				}
+				if (refusalMode === "getter") {
+					const obj = {};
+					Object.defineProperty(obj, "x", { enumerable: true, get() { refusalGetters++; return "admission-refused"; } });
+					obj.p = Promise.reject(new Error("refusal-getter-promise"));
+					return obj;
+				}
+				return refusalMode;
+			},
+		});
+		const callClock = callClockOf(clock);
+		half.ready({
+			invoke: async (call) => {
+				invokeCalls++;
+				return {
+					ending: "answered",
+					invocation: call.invocation,
+					attempt: `${call.invocation}.00000001`,
+					operation: call.operation,
+					answer: { echoed: call.input },
+				};
+			},
+		}, callClock);
+
+		const pairClient = () => {
+			let clientHandlers;
+			let proxyHandlers;
+			const linkToProxy = {
+				write(msg) { proxyHandlers?.message(msg); return true; },
+				close() { proxyHandlers?.closed(); clientHandlers?.closed(); },
+				hold() {},
+			};
+			const linkToClient = {
+				write(msg) { clientHandlers?.message(msg); return true; },
+				close() { clientHandlers?.closed(); proxyHandlers?.closed(); },
+				hold() {},
+			};
+			return createProxyClient({
+				key: KEY,
+				clock,
+				identities: machineIdentities,
+				connector: {
+					connect: async (handlers) => {
+						clientHandlers = handlers;
+						proxyHandlers = half.accept(linkToClient);
+						return { kind: "connected", link: linkToProxy };
+					},
+					launch: () => {},
+				},
+			});
+		};
+		const c1 = pairClient();
+		refusalMode = "admission-refused";
+		const refEnd = await c1.invoke({ host: "host-a", service: "svc", operation: "echo", input: 1, bound: 1000, repeat: true });
+		assert.equal(refEnd.ending, "not-delivered");
+		assert.equal(refEnd.proxyCode, "admission-refused");
+		assert.equal(refEnd.agpCode, null);
+		assert.equal(refEnd.attempt, null);
+		assert.equal(refEnd.earlierAttemptsUncertain, true);
+		assert.equal(invokeCalls, 0, "caller.invoke was not called when invocationRefusal returned admission-refused");
+
+		for (const nonRefusing of [null, undefined, "other", "throw", "getter"]) {
+			refusalMode = nonRefusing;
+			const ans = await c1.invoke({ host: "host-a", service: "svc", operation: "echo", input: String(nonRefusing), bound: 1000 });
+			assert.equal(ans.ending, "answered");
+		}
+		assert.equal(invokeCalls, 5);
+		assert.equal(refusalGetters, 0, "getters on invocationRefusal return value are never called");
+		c1.close();
+
+		// 3. Late hello after refuseStartup("admission-refused") receives refused admission-refused, ready() after refuseStartup is a no-op, and status reports ready: false:
+		const half2 = createProxyHalf({ key: KEY, clock, idleMs: 60_000, onIdle: () => {} });
+		assert.throws(() => half2.refuseStartup("key-mismatch"), TypeError);
+		half2.refuseStartup("admission-refused");
+		half2.ready({ invoke: async () => { throw new Error("never"); } }, callClock);
+		let clientHandlers2;
+		let proxyHandlers2;
+		const c2 = createProxyClient({
+			key: KEY,
+			clock,
+			identities: machineIdentities,
+			connector: {
+				connect: async (handlers) => {
+					clientHandlers2 = handlers;
+					proxyHandlers2 = half2.accept({
+						write(msg) { clientHandlers2?.message(msg); return true; },
+						close() { clientHandlers2?.closed(); proxyHandlers2?.closed(); },
+						hold() {},
+					});
+					return {
+						kind: "connected",
+						link: {
+							write(msg) { proxyHandlers2?.message(msg); return true; },
+							close() { proxyHandlers2?.closed(); clientHandlers2?.closed(); },
+							hold() {},
+						},
+					};
+				},
+				launch: () => {},
+			},
+		});
+		const st2 = await c2.status({ timeMs: 1000 });
+		assert.deepEqual(st2, { state: "running", ready: false, connections: 0, inFlight: 0, target: null });
+		const lateInv = await c2.invoke({ host: "host-a", service: "svc", operation: "echo", input: 1, bound: 1000 });
+		assert.equal(lateInv.ending, "not-delivered");
+		assert.equal(lateInv.proxyCode, "admission-refused");
+		c2.close();
+		await settle(10);
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+	assert.deepEqual(unhandled, [], "zero unhandled rejections");
+});
+

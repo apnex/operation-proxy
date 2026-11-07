@@ -66,10 +66,13 @@ export function fixtureProxyApplication(config) {
 				listeners: new Map(listen ? [["listen", { fabricId, address: name }]] : []),
 				targets: new Map(targets.map((t) => [t, { fabricId, address: t }])),
 			});
+			const identityAdmission = {
+				evaluate: async () => ({ decision: "allow", authorizationAssociation: { mode: "unauthenticated" } }),
+			};
 			const nodeId = `${key.identity}.${randomBytes(8).toString("hex")}`;
-			const host = createNode({ nodeId: "host-a", listen: { transportRef: "listen" }, capacity: { maxSessions: 4, maxPendingHandshakes: 4 }, disposition: { debounceMs: 0 } }, { transport: port("host-a", true, []) });
+			const host = createNode({ nodeId: "host-a", listen: { transportRef: "listen" }, capacity: { maxSessions: 4, maxPendingHandshakes: 4 }, disposition: { debounceMs: 0 } }, { transport: port("host-a", true, []), identityAdmission });
 			const proxyNode = createNode({ nodeId, capacity: { maxSessions: 4, maxPendingHandshakes: 4 }, disposition: { debounceMs: 0 },
-				peers: [{ adjacencyId: "host-a", expectedNodeId: "host-a", transportRef: "host-a", reconnect: { initialDelayMs: 10, maximumDelayMs: 100 } }] }, { transport: port(nodeId, false, ["host-a"]) });
+				peers: [{ adjacencyId: "host-a", expectedNodeId: "host-a", transportRef: "host-a", reconnect: { initialDelayMs: 10, maximumDelayMs: 100 } }] }, { transport: port(nodeId, false, ["host-a"]), identityAdmission });
 			await host.start();
 			let gathering = [];
 			for (const service of SERVICES) {

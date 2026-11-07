@@ -66,6 +66,8 @@ export interface ProxyHalfOptions {
 	readonly onIdle: () => void;
 	/** Optional synchronous callback returning application-specific plain JSON status for `status` replies (PX9). */
 	readonly status?: () => unknown;
+	/** Optional synchronous callback checked before handing an `invoke` to `caller.invoke` (PX6, PX9; zorg's D71, D75). */
+	readonly invocationRefusal?: () => "admission-refused" | null | undefined;
 }
 
 /** The proxy half. */
@@ -77,6 +79,12 @@ export interface ProxyHalf {
 	 * call is made through this caller, whose clock port is `callClock`.
 	 */
 	ready(caller: CallLayerCaller, callClock: PinnableCallClock): void;
+	/**
+	 * Latches terminal startup refusal (PX4, PX6, PX9; zorg's D71, D75): `ready` becomes a no-op, every waiting
+	 * `hello` connection and any subsequent valid `hello` arriving before channel close is answered `refused` with
+	 * `code: "admission-refused"` and closed, while `status` continues to report `ready: false`.
+	 */
+	refuseStartup(code: "admission-refused"): void;
 	/** How many connections are open. */
 	connections(): number;
 	/** How many calls are in flight: handed to the caller, their endings not yet sent or dropped. */
@@ -133,6 +141,7 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 	const helloConns = new Set<Conn>();
 	let caller: CallLayerCaller | undefined;
 	let callClock: PinnableCallClock | undefined;
+	let startupRefusedCode: "admission-refused" | undefined;
 	let inFlight = 0;
 	let idleTimer: HopTimer | undefined;
 	let idleDeadlineNs: bigint | undefined;
@@ -248,6 +257,24 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 		if (stoppingInvocations) {
 			send(conn, invoke.request, proxyNotDelivered("proxy-stopping", invoke.invocation, invoke.operation, invoke.repeat));
 			return;
+		}
+		if (options.invocationRefusal !== undefined) {
+			let refused = false;
+			try {
+				const rawRefusal = options.invocationRefusal();
+				const plain = readPlainJson(rawRefusal);
+				if (plain.ok) {
+					if (plain.value === "admission-refused") refused = true;
+				} else {
+					observePromises(rawRefusal);
+				}
+			} catch (error) {
+				observePromises(error);
+			}
+			if (refused) {
+				send(conn, invoke.request, proxyNotDelivered("admission-refused", invoke.invocation, invoke.operation, invoke.repeat));
+				return;
+			}
 		}
 		const now = clock.nowNs();
 		const left = BigInt(invoke.deadline) - now;
@@ -367,6 +394,13 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 					reviewIdle();
 					return;
 				}
+				if (startupRefusedCode !== undefined) {
+					helloConns.delete(conn);
+					conn.link.write(writeRefused(startupRefusedCode));
+					close(conn);
+					reviewIdle();
+					return;
+				}
 				helloConns.delete(conn);
 				conns.add(conn);
 				reviewIdle();
@@ -419,7 +453,7 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 			};
 		},
 		ready(readyCaller: CallLayerCaller, readyClock: PinnableCallClock): void {
-			if (caller !== undefined) return;
+			if (caller !== undefined || startupRefusedCode !== undefined) return;
 			caller = readyCaller;
 			callClock = readyClock;
 			for (const conn of conns) {
@@ -427,6 +461,18 @@ export function createProxyHalf(options: ProxyHalfOptions): ProxyHalf {
 				conn.state = "welcomed";
 				conn.link.write(writeWelcome());
 			}
+		},
+		refuseStartup(code: "admission-refused"): void {
+			if (code !== "admission-refused") throw new TypeError("refuseStartup only accepts \"admission-refused\"");
+			if (caller !== undefined || startupRefusedCode !== undefined) return;
+			startupRefusedCode = code;
+			for (const conn of [...conns]) {
+				if (conn.state !== "waiting") continue;
+				conns.delete(conn);
+				conn.link.write(writeRefused(code));
+				close(conn);
+			}
+			reviewIdle();
 		},
 		connections: () => conns.size,
 		inFlight: () => inFlight,

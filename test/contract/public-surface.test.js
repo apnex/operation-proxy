@@ -100,9 +100,14 @@ test("only the machine's clock and runtime adapters read a clock or randomness; 
 	}
 });
 
-test("the package depends on operation-call and shape-check through file: links to the checkouts beside it, and on nothing else at run time", () => {
-	assert.deepEqual(pkg.dependencies, { "@apnex/operation-call": "file:../operation-call", "@apnex/shape-check": "file:../shape-check" });
+const validDepSpec = (name, spec) => spec === `file:../${name}` || new RegExp(`^https://github\\.com/apnex/${name}/releases/download/v0\\.\\d+\\.\\d+/apnex-${name}-0\\.\\d+\\.\\d+\\.tgz$`).test(spec);
+
+test("the package depends on operation-call and shape-check through file: links or pinned GitHub release URLs, and on nothing else at run time", () => {
+	assert.deepEqual(Object.keys(pkg.dependencies ?? {}).sort(), ["@apnex/operation-call", "@apnex/shape-check"]);
+	assert.ok(validDepSpec("operation-call", pkg.dependencies["@apnex/operation-call"]));
+	assert.ok(validDepSpec("shape-check", pkg.dependencies["@apnex/shape-check"]));
 	for (const [name, spec] of Object.entries(pkg.devDependencies)) {
-		if (name.startsWith("@agp/") || name.startsWith("@apnex/")) assert.match(spec, /^file:\.\.\//, `${name} is linked from a checkout beside this one`);
+		if (name.startsWith("@agp/")) assert.match(spec, /^file:\.\.\//, `${name} is linked from a checkout beside this one`);
+		else if (name.startsWith("@apnex/")) assert.ok(validDepSpec(name.slice(7), spec), `${name} is linked from a checkout or pinned release`);
 	}
 });

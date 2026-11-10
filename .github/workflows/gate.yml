@@ -1,0 +1,98 @@
+# The gate (docs/DECISIONS.md, the first release; snap-grid's, taken under draw's H31-5): the repository's own
+# tests and its docs check on every push and pull request, on Node 22 and Node 24, then the consumer test on
+# Node 22: the package packed, installed into an empty project with --omit=dev, which installs no AGP, and
+# every export imported by name and its browser paths loaded in headless Chrome.
+#
+# AGP is taken for development only (zorg's answer 3): apnex/agp is checked out at b179b4f beside this
+# repository and built before npm ci, so its file: links to ../agp/packages resolve; this repository is
+# checked out into its own folder, operation-proxy/, since a checkout must sit inside the workspace.
+name: gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    # a backstop: a hang fails the job rather than holding a runner for hours
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    defaults:
+      run:
+        working-directory: operation-proxy
+    env:
+      AGP_COMMIT: b179b4f
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: operation-proxy
+      # AGP's packages, which the tests and the type check use as file: links to ../agp/packages, at the revision
+      # zorg certified (zorg's answer 3): checked out beside this repository, inside the workspace
+      - name: fetch AGP
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: apnex/agp
+          path: agp
+          fetch-depth: 0
+      - name: AGP at b179b4f
+        run: |
+          git -C ../agp checkout --quiet --detach "$AGP_COMMIT"
+          case "$(git -C ../agp rev-parse HEAD)" in "$AGP_COMMIT"*) ;; *) echo "AGP is not at $AGP_COMMIT"; exit 1 ;; esac
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: |
+            operation-proxy/package-lock.json
+            agp/package-lock.json
+      - name: build AGP
+        run: npm --prefix ../agp ci && npm --prefix ../agp run build
+      - run: npm ci
+      - run: npm test
+      - run: npm run docs:check
+
+  consumer:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: operation-proxy
+    env:
+      AGP_COMMIT: b179b4f
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: operation-proxy
+      # AGP's packages, which the tests and the type check use as file: links to ../agp/packages, at the revision
+      # zorg certified (zorg's answer 3): checked out beside this repository, inside the workspace
+      - name: fetch AGP
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: apnex/agp
+          path: agp
+          fetch-depth: 0
+      - name: AGP at b179b4f
+        run: |
+          git -C ../agp checkout --quiet --detach "$AGP_COMMIT"
+          case "$(git -C ../agp rev-parse HEAD)" in "$AGP_COMMIT"*) ;; *) echo "AGP is not at $AGP_COMMIT"; exit 1 ;; esac
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            operation-proxy/package-lock.json
+            agp/package-lock.json
+      - name: build AGP
+        run: npm --prefix ../agp ci && npm --prefix ../agp run build
+      - run: npm ci
+      - name: the consumer test
+        run: node tools/consumer-test.mjs

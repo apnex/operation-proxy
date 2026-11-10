@@ -1,6 +1,6 @@
 {
   "name": "@apnex/operation-proxy",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "description": "Let short-lived processes invoke named operations through one long-lived caller they share, each invocation still ending honestly.",
   "license": "MIT",
@@ -11,7 +11,7 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=24"
+    "node": ">=22.13"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -42,11 +42,12 @@
     "@agp/core": "file:../agp/packages/core",
     "@agp/node": "file:../agp/packages/node",
     "@agp/transport-loopback": "file:../agp/packages/transport-loopback",
+    "@apnex/headless-chromium": "https://github.com/apnex/headless-chromium/releases/download/v0.2.0/apnex-headless-chromium-0.2.0.tgz",
     "@types/node": "^24.0.0",
     "typescript": "5.9.3"
   },
   "dependencies": {
-    "@apnex/operation-call": "file:../operation-call",
-    "@apnex/shape-check": "file:../shape-check"
+    "@apnex/operation-call": "https://github.com/apnex/operation-call/releases/download/v0.1.0/apnex-operation-call-0.1.0.tgz",
+    "@apnex/shape-check": "https://github.com/apnex/shape-check/releases/download/v0.1.0/apnex-shape-check-0.1.0.tgz"
   }
 }

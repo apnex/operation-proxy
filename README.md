@@ -11,9 +11,9 @@ Its contract tests run operation-call's caller suite through the client half, an
 - `CONTRACT.md` - what a consumer can depend on, one capability per row.
 - `docs/DECISIONS.md` - the rulings about this component.
 
-It belongs to a component set first composed by zorg (`apnex/zorg`), and is private until its first working code.
+It belongs to a component set first composed by zorg (`apnex/zorg`), and is released only by its own CI, as a tarball attached to a GitHub release with its SHA-512 beside it, which a consumer names in its `package.json`: `https://github.com/apnex/operation-proxy/releases/download/v0.1.0/apnex-operation-proxy-0.1.0.tgz` for `0.1.0`.
 
-It depends on `@apnex/operation-call` and `@apnex/shape-check` through `file:` links to checkouts beside it, and its tests on `@agp/core`, `@agp/node` and `@agp/transport-loopback` the same way.\
+It depends on `@apnex/operation-call` and `@apnex/shape-check` through their release files, and its tests on `@agp/core`, `@agp/node` and `@agp/transport-loopback` through `file:` links to an AGP checkout beside it.\
 Each checkout must be installed and built first, since no `dist/` is committed.\
 The tests create `.operation-proxy` in the home directory the user database records, as every proxy of the user does, and leave its `secret` there.
 

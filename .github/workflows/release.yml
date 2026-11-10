@@ -1,0 +1,153 @@
+# A release (docs/DECISIONS.md, the first release; snap-grid's, taken under draw's H31-5): a run on a pushed tag
+# v<semver>, one at a time per repository, with contents: write and nothing else. It refuses a tag that is
+# not package.json's version, a version outside 0.x, or a tag that already has a published release; runs the
+# gate; packs the package once and writes the file's SHA-512; runs the consumer test on that very file;
+# creates a draft release holding the file and its SHA-512; downloads both back through the authenticated API
+# and compares them byte for byte with what it packed; and only then publishes.
+#
+# A failed run leaves at most a draft, which the next run of the same tag deletes and remakes; a published
+# release is never replaced, and a fix is a new version. Only this workflow makes a release.
+#
+# AGP is taken for development only (zorg's answer 3): apnex/agp is checked out at b179b4f beside this
+# repository and built before npm ci, so its file: links to ../agp/packages resolve; this repository is
+# checked out into its own folder, operation-proxy/, since a checkout must sit inside the workspace.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+# GitHub keeps one running and at most one pending run per group: a third tag pushed while one run waits
+# cancels the waiting run, which is then re-run by hand.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # a backstop: a hang fails the run rather than holding a runner for hours
+    timeout-minutes: 20
+    # gh api takes no --repo: every call below names repos/$GITHUB_REPOSITORY in its path, and GH_REPO
+    # names it too, so no call relies on the checkout's remote
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      AGP_COMMIT: b179b4f
+    defaults:
+      run:
+        working-directory: operation-proxy
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: operation-proxy
+      # AGP's packages, which the tests and the type check use as file: links to ../agp/packages, at the revision
+      # zorg certified (zorg's answer 3): checked out beside this repository, inside the workspace
+      - name: fetch AGP
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: apnex/agp
+          path: agp
+          fetch-depth: 0
+      - name: AGP at b179b4f
+        run: |
+          git -C ../agp checkout --quiet --detach "$AGP_COMMIT"
+          case "$(git -C ../agp rev-parse HEAD)" in "$AGP_COMMIT"*) ;; *) echo "AGP is not at $AGP_COMMIT"; exit 1 ;; esac
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            operation-proxy/package-lock.json
+            agp/package-lock.json
+      - name: build AGP
+        run: npm --prefix ../agp ci && npm --prefix ../agp run build
+
+      # versions are 0.x while the component evolves across its consumers (zorg's answer 4)
+      - name: refuse a tag that differs from package.json's version, or a version outside 0.x
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "v$version" ]; then
+            echo "the tag $TAG is not v$version, package.json's version"
+            exit 1
+          fi
+          case "$version" in
+            0.*) ;;
+            *) echo "version $version is outside 0.x"; exit 1 ;;
+          esac
+          echo "FILE=apnex-operation-proxy-$version.tgz" >> "$GITHUB_ENV"
+
+      # A draft is not found by its tag -- GET /releases/tags/{tag} answers 404 for one -- so every
+      # release of the tag is found by listing them all.
+      - name: refuse a tag that already has a published release, and delete a draft of it
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[] | [.id, .draft, .tag_name] | @tsv' > "$RUNNER_TEMP/releases.tsv"
+          if awk -F'\t' -v tag="$TAG" '$3 == tag && $2 == "false" { found = 1 } END { exit !found }' "$RUNNER_TEMP/releases.tsv"; then
+            echo "$TAG already has a published release, which is never replaced; a fix is a new version"
+            exit 1
+          fi
+          awk -F'\t' -v tag="$TAG" '$3 == tag && $2 == "true" { print $1 }' "$RUNNER_TEMP/releases.tsv" | while read -r id; do
+            echo "deleting draft release $id of $TAG, left by an earlier run"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done
+
+      - run: npm ci
+      - name: the gate
+        run: npm test && npm run docs:check
+      # packed once: the consumer test installs this very file, and the draft attaches it
+      - name: pack, and write the file's SHA-512
+        run: |
+          mkdir -p "$RUNNER_TEMP/packed"
+          npm run build
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/packed"
+          cd "$RUNNER_TEMP/packed"
+          test -f "$FILE"
+          sha512sum "$FILE" > "$FILE.sha512"
+          cat "$FILE.sha512"
+
+      - name: the consumer test, on the packed file
+        run: node tools/consumer-test.mjs --tarball "$RUNNER_TEMP/packed/$FILE"
+
+      - name: create a draft release holding the file and its SHA-512
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" \
+            --notes "@apnex/operation-proxy ${TAG#v}. Name this release's tarball in package.json; its SHA-512 is attached beside it." \
+            "$RUNNER_TEMP/packed/$FILE" "$RUNNER_TEMP/packed/$FILE.sha512"
+          # the list of releases can lag the create by a few seconds, so the lookup is retried, bounded
+          ids=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id")
+            [ -n "$ids" ] && break
+            sleep 5
+          done
+          if [ -z "$ids" ] || [ "$(printf '%s\n' "$ids" | wc -l)" != 1 ]; then
+            echo "expected one draft release of $TAG, found: $ids"
+            exit 1
+          fi
+          echo "DRAFT_ID=$ids" >> "$GITHUB_ENV"
+
+      # A draft's public address answers 404, so both files come back through the authenticated API,
+      # by the draft's id and each asset's id.
+      - name: download both back through the authenticated API, and compare them byte for byte
+        run: |
+          mkdir -p "$RUNNER_TEMP/downloaded"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID/assets" --jq '.[] | [.id, .name] | @tsv' > "$RUNNER_TEMP/assets.tsv"
+          if [ "$(wc -l < "$RUNNER_TEMP/assets.tsv")" != 2 ]; then
+            echo "the draft holds these assets, not the file and its SHA-512:"
+            cat "$RUNNER_TEMP/assets.tsv"
+            exit 1
+          fi
+          while IFS=$'\t' read -r asset name; do
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$asset" > "$RUNNER_TEMP/downloaded/$name"
+          done < "$RUNNER_TEMP/assets.tsv"
+          cmp "$RUNNER_TEMP/packed/$FILE" "$RUNNER_TEMP/downloaded/$FILE"
+          cmp "$RUNNER_TEMP/packed/$FILE.sha512" "$RUNNER_TEMP/downloaded/$FILE.sha512"
+          cd "$RUNNER_TEMP/downloaded"
+          sha512sum -c "$FILE.sha512"
+
+      - name: publish the draft, only now
+        run: gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID" -F draft=false --jq '.html_url'

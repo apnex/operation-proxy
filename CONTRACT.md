@@ -1,8 +1,8 @@
 ---
-id: unminted
+id: C8
 category: component
 title: operation-proxy - named operations from short-lived processes, through one long-lived caller they share
-status: draft
+status: active
 hydrate-when: Short-lived processes in your system invoke named operations, and you are about to give each its own connection to the delivery beneath
 sovereignty: internal
 supersedes: []
@@ -12,8 +12,8 @@ related: [C0, A3]
 # operation-proxy
 
 The contract of record for operation-proxy: what a consumer can depend on, admitted to zorg's component set by the director's ruling `D29` in zorg's `docs/DECISIONS.md`, and named by its `D30`; its vision is ratified (zorg's `D50`), and this contract is a draft until its capabilities are built and verified.\
-It also carries the fields of a mission-kit registry entry, and that entry is generated from this file when the component is filed, never written as a second copy.\
-The registry id is unminted on purpose; one is minted only when the entry is admitted to the registry.
+It also carries the fields of a mission-kit registry entry, and that entry is generated from this file, never written as a second copy.\
+Admitted to mission-kit's component registry as `C8`, its first release `0.1.0` (`docs/DECISIONS.md` `D8`); its frontmatter is the entry's.
 
 **Status: its design certified at zorg's Delta 1, stage 0, for amendments 1 and 4 (`E13`); provisional until stage 4a builds it.**
 
@@ -193,9 +193,9 @@ Tested by: `E17`, in that file; `E6`, in operation-call's tests, which run the s
 
 ## Reference
 
-This repository, `apnex/operation-proxy`, private until its first working code is certified.\
+This repository, `apnex/operation-proxy`, and its package `@apnex/operation-proxy`, released only by its own CI as a tarball attached to a GitHub release, drafted, verified and then published (`.github/workflows/release.yml`).\
 The package `@apnex/operation-proxy` exports `createProxyClient` and `createProxyHalf`, the two halves over any channel and clock, `callClockOf`, `keyDigest`, `CHANNEL_LIMITS` and `DEFAULT_HOP_ALLOWANCE_MS`, and imports no module particular to one runtime; `@apnex/operation-proxy/machine` exports the machine adapter for Linux, `createMachineClient`, `startMachineProxy` and `runMachineProxy`; and `@apnex/operation-proxy/browser` exports the browser adapter (`PX8`), `createBrowserClient` and `runBrowserProxy`, as `export-map.json` records.\
-It depends on `@apnex/operation-call` and `@apnex/shape-check` through `file:` links, and its tests on AGP's packages the same way.
+It depends on `@apnex/operation-call` and `@apnex/shape-check` through their release files, and its tests on AGP's packages through `file:` links to an AGP checkout beside it.
 
 ---
 
